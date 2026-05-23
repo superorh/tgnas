@@ -129,6 +129,16 @@ func (s *ObjectStore) PutObject(ctx context.Context, input PutObjectInput) (PutO
 	if err != nil {
 		return PutObjectResult{}, err
 	}
+	chunkSize := int64(0)
+	chunkCount := 1
+	if strategy.Chunked {
+		chunkSize = strategy.ChunkSize
+		if chunkSize <= 0 {
+			chunkSize = s.options.Upload.ChunkSize
+		}
+		chunkCount = int((input.Size + chunkSize - 1) / chunkSize)
+	}
+	s.logger.Printf("debug event=put_object_decision bucket=%q key=%q size=%d telegram_type=%q strategy=%q chunked=%t chunk_size=%d chunk_count=%d", input.Bucket, input.Key, input.Size, strategy.TelegramType, strategy.UploadStrategy, strategy.Chunked, chunkSize, chunkCount)
 
 	if !strategy.Chunked {
 		limit := s.options.Upload.TypeLimits[strategy.TelegramType]
@@ -411,6 +421,7 @@ func (s *ObjectStore) putSingle(ctx context.Context, input PutObjectInput, strat
 
 	caption := s.renderCaption(input, 1, 1)
 	go func() {
+		s.logger.Printf("debug event=telegram_upload_part bucket=%q key=%q part=%d parts=%d media_type=%q", input.Bucket, input.Key, 1, 1, strategy.TelegramType)
 		uploaded, err := s.uploadTelegram(ctx, telegram.UploadRequest{
 			Type:     strategy.TelegramType,
 			ChatID:   s.bucketChatID(input.Bucket),
@@ -424,6 +435,7 @@ func (s *ObjectStore) putSingle(ctx context.Context, input PutObjectInput, strat
 			resultCh <- uploadResult{err: err}
 			return
 		}
+		s.logger.Printf("debug event=telegram_upload_part_result bucket=%q key=%q part=%d message_id=%d file_id_returned=%t", input.Bucket, input.Key, 1, uploaded.MessageID, uploaded.FileID != "")
 		_ = pipeReader.Close()
 		resultCh <- uploadResult{uploaded: uploaded}
 	}()
@@ -493,9 +505,11 @@ func (s *ObjectStore) putSingle(ctx context.Context, input PutObjectInput, strat
 		SHA256:               shaSum,
 	}}
 	if err := s.meta.PutObject(ctx, object, chunks); err != nil {
+		s.logMetadataPutObject(input.Bucket, input.Key, len(chunks), etag, err)
 		s.logOrphanUpload(input.Bucket, input.Key, []uploadRecord{{FileID: uploaded.FileID, MessageID: uploaded.MessageID}}, err)
 		return PutObjectResult{}, err
 	}
+	s.logMetadataPutObject(input.Bucket, input.Key, len(chunks), etag, nil)
 	return PutObjectResult{ETag: etag}, nil
 }
 
@@ -508,6 +522,7 @@ func (s *ObjectStore) putChunked(ctx context.Context, input PutObjectInput, stra
 		chunkSize = s.options.Upload.ChunkSize
 	}
 	parts := int((input.Size + chunkSize - 1) / chunkSize)
+	s.logger.Printf("debug event=put_object_chunking bucket=%q key=%q size=%d chunk_size=%d chunk_count=%d", input.Bucket, input.Key, input.Size, chunkSize, parts)
 	chunks := make([]metadata.Chunk, 0, parts)
 	uploads := make([]uploadRecord, 0, parts)
 	offset := int64(0)
@@ -531,6 +546,7 @@ func (s *ObjectStore) putChunked(ctx context.Context, input PutObjectInput, stra
 		_, _ = wholeMD5.Write(partData)
 		_, _ = wholeSHA.Write(partData)
 		chunkSHA := sha256.Sum256(partData)
+		s.logger.Printf("debug event=telegram_upload_part bucket=%q key=%q part=%d parts=%d media_type=%q", input.Bucket, input.Key, part, parts, telegram.TypeDocument)
 		uploaded, err := s.uploadTelegram(ctx, telegram.UploadRequest{
 			Type:     telegram.TypeDocument,
 			ChatID:   s.bucketChatID(input.Bucket),
@@ -545,6 +561,7 @@ func (s *ObjectStore) putChunked(ctx context.Context, input PutObjectInput, stra
 			}
 			return PutObjectResult{}, err
 		}
+		s.logger.Printf("debug event=telegram_upload_part_result bucket=%q key=%q part=%d message_id=%d file_id_returned=%t", input.Bucket, input.Key, part, uploaded.MessageID, uploaded.FileID != "")
 		chunks = append(chunks, metadata.Chunk{
 			Bucket:               input.Bucket,
 			Key:                  input.Key,
@@ -582,9 +599,11 @@ func (s *ObjectStore) putChunked(ctx context.Context, input PutObjectInput, stra
 		UploadStrategy: strategy.UploadStrategy,
 	}
 	if err := s.meta.PutObject(ctx, object, chunks); err != nil {
+		s.logMetadataPutObject(input.Bucket, input.Key, len(chunks), etag, err)
 		s.logOrphanUpload(input.Bucket, input.Key, uploads, err)
 		return PutObjectResult{}, err
 	}
+	s.logMetadataPutObject(input.Bucket, input.Key, len(chunks), etag, nil)
 	return PutObjectResult{ETag: etag}, nil
 }
 
@@ -637,15 +656,36 @@ func (s *ObjectStore) acquire(ctx context.Context, sem chan struct{}) func() {
 	}
 }
 
+func (s *ObjectStore) logMetadataPutObject(bucket, key string, chunkCount int, etag string, err error) {
+	if s.logger == nil {
+		return
+	}
+	if err != nil {
+		s.logger.Printf("debug event=metadata_put_object bucket=%q key=%q chunk_count=%d etag=%q result=error error=%q", bucket, key, chunkCount, etag, sanitizeLogError(err))
+		return
+	}
+	s.logger.Printf("debug event=metadata_put_object bucket=%q key=%q chunk_count=%d etag=%q result=success", bucket, key, chunkCount, etag)
+}
+
 func (s *ObjectStore) logOrphanUpload(bucket, key string, uploads []uploadRecord, err error) {
 	if s.logger == nil {
 		return
 	}
 	parts := make([]string, 0, len(uploads))
 	for _, upload := range uploads {
-		parts = append(parts, fmt.Sprintf("file_id=%s message_id=%d", upload.FileID, upload.MessageID))
+		parts = append(parts, fmt.Sprintf("file_id=%s message_id=%d", summarizeFileID(upload.FileID), upload.MessageID))
 	}
-	s.logger.Printf("event=orphan_upload bucket=%q key=%q uploads=[%s] error=%q", bucket, key, strings.Join(parts, " "), sanitizeLogError(err))
+	s.logger.Printf("debug event=orphan_upload bucket=%q key=%q uploads=[%s] error=%q", bucket, key, strings.Join(parts, " "), sanitizeLogError(err))
+}
+
+func summarizeFileID(value string) string {
+	if value == "" {
+		return ""
+	}
+	if len(value) <= 8 {
+		return "[redacted]"
+	}
+	return value[:4] + "..." + value[len(value)-4:]
 }
 
 var sensitiveAssignmentPattern = regexp.MustCompile(`(?i)\b(bot_token|secret_key)\b\s*([=:])\s*([^\s,;]+)`)

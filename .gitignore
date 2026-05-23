@@ -2,8 +2,8 @@
 .idea/
 
 /tgs3
+*.sqlite*
 
 .worktrees
 .claude/worktrees
 .claude/settings.local.json
-

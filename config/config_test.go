@@ -100,6 +100,68 @@ buckets:
 	}
 }
 
+func TestLoadConfigDefaultsRegionAndSQLitePath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	err := os.WriteFile(path, []byte(`
+auth:
+  credentials:
+    - access_key: "admin"
+      secret_key_env: "SECRET"
+telegram:
+  bot_token_env: "BOT_TOKEN"
+buckets:
+  photos:
+    chat_id: "-100123"
+`), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile returned error: %v", err)
+	}
+	if cfg.Auth.Region != "us-east-1" {
+		t.Fatalf("region = %q", cfg.Auth.Region)
+	}
+	got, err := cfg.ResolveSQLitePath()
+	if err != nil {
+		t.Fatalf("ResolveSQLitePath returned error: %v", err)
+	}
+	if got != "data/metadata.sqlite" {
+		t.Fatalf("path = %q", got)
+	}
+}
+
+func TestDefaultListenEnvOverridesListen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	err := os.WriteFile(path, []byte(`
+auth:
+  credentials:
+    - access_key: "admin"
+      secret_key_env: "SECRET"
+telegram:
+  bot_token_env: "BOT_TOKEN"
+buckets:
+  photos:
+    chat_id: "-100123"
+`), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TGS3_LISTEN", "127.0.0.1:12345")
+
+	cfg, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile returned error: %v", err)
+	}
+	if got := cfg.ResolveListen(); got != "127.0.0.1:12345" {
+		t.Fatalf("listen = %q", got)
+	}
+}
+
 func TestSQLitePathEnvPrecedence(t *testing.T) {
 	t.Setenv("TGS3_SQLITE_PATH", "/env/tgs3.sqlite")
 	cfg := Config{Metadata: MetadataConfig{Driver: "sqlite", SQLitePath: "/file/tgs3.sqlite", SQLitePathEnv: "TGS3_SQLITE_PATH"}}
@@ -228,6 +290,84 @@ func TestValidateRejectsMissingDocumentTypeSizeLimit(t *testing.T) {
 	cfg.Storage.TypeSizeLimits["document"] = 0
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected validation error")
+	}
+}
+
+func TestBucketChatIDResolvesFullEnvReference(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	err := os.WriteFile(path, []byte(`
+auth:
+  credentials:
+    - access_key: "admin"
+      secret_key_env: "SECRET"
+telegram:
+  bot_token_env: "BOT_TOKEN"
+buckets:
+  photos:
+    chat_id: "${TGS3_PHOTOS_CHAT_ID}"
+`), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TGS3_PHOTOS_CHAT_ID", "-100999")
+
+	cfg, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile returned error: %v", err)
+	}
+	if got := cfg.Buckets["photos"].ChatID; got != "-100999" {
+		t.Fatalf("chat_id = %q", got)
+	}
+}
+
+func TestBucketChatIDRejectsPartialEnvInterpolation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	err := os.WriteFile(path, []byte(`
+auth:
+  credentials:
+    - access_key: "admin"
+      secret_key_env: "SECRET"
+telegram:
+  bot_token_env: "BOT_TOKEN"
+buckets:
+  photos:
+    chat_id: "prefix-${TGS3_PHOTOS_CHAT_ID}"
+`), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TGS3_PHOTOS_CHAT_ID", "123")
+
+	_, err = LoadFile(path)
+	if err == nil {
+		t.Fatal("expected partial interpolation error")
+	}
+}
+
+func TestBucketChatIDFailsWhenReferencedEnvMissing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	err := os.WriteFile(path, []byte(`
+auth:
+  credentials:
+    - access_key: "admin"
+      secret_key_env: "SECRET"
+telegram:
+  bot_token_env: "BOT_TOKEN"
+buckets:
+  photos:
+    chat_id: "${TGS3_MISSING_CHAT_ID}"
+`), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TGS3_MISSING_CHAT_ID", "")
+
+	_, err = LoadFile(path)
+	if err == nil {
+		t.Fatal("expected empty chat id validation error")
 	}
 }
 

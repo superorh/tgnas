@@ -83,12 +83,13 @@ type BucketConfig struct {
 
 func LoadFile(path string) (Config, error) {
 	cfg := Config{
-		Server: ServerConfig{Listen: ":9000"},
+		Server: ServerConfig{Listen: ":9000", ListenEnv: "TGS3_LISTEN"},
+		Auth:   AuthConfig{Region: "us-east-1"},
 		Telegram: TelegramConfig{
 			APIBaseURL: "https://api.telegram.org",
 			Timeout:    30 * time.Second,
 		},
-		Metadata: MetadataConfig{Driver: "sqlite"},
+		Metadata: MetadataConfig{Driver: "sqlite", SQLitePath: "data/metadata.sqlite"},
 		Storage:  DefaultStorageConfig(),
 		Buckets:  map[string]BucketConfig{},
 	}
@@ -109,6 +110,15 @@ func LoadFile(path string) (Config, error) {
 	}
 
 	applyStorageDefaults(&cfg.Storage)
+
+	for name, bucket := range cfg.Buckets {
+		chatID, err := resolveBucketChatID(bucket.ChatID)
+		if err != nil {
+			return Config{}, fmt.Errorf("resolve bucket %q chat_id: %w", name, err)
+		}
+		bucket.ChatID = chatID
+		cfg.Buckets[name] = bucket
+	}
 
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -270,6 +280,19 @@ func applyStorageDefaults(storage *StorageConfig) {
 	if storage.PutBufferSize == 0 {
 		storage.PutBufferSize = defaults.PutBufferSize
 	}
+}
+
+func resolveBucketChatID(value string) (string, error) {
+	hasEnvReference := strings.Contains(value, "${") || strings.Contains(value, "}")
+	isFullEnvReference := strings.HasPrefix(value, "${") && strings.HasSuffix(value, "}") && strings.Count(value, "${") == 1 && strings.Count(value, "}") == 1
+	if hasEnvReference && !isFullEnvReference {
+		return "", fmt.Errorf("environment reference must use full ${ENV_NAME} form")
+	}
+	if isFullEnvReference {
+		envName := value[2 : len(value)-1]
+		return os.Getenv(envName), nil
+	}
+	return value, nil
 }
 
 func boolPtr(v bool) *bool {

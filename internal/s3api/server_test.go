@@ -1,10 +1,14 @@
 package s3api
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -101,6 +105,49 @@ func TestPutHeadGetDeleteObject(t *testing.T) {
 	}
 }
 
+func TestPutObjectAcceptsUnsignedPayload(t *testing.T) {
+	server := newSignedTestServer(t)
+	put := signedUnsignedPayloadRecorderRequest(t, http.MethodPut, "/photos/unsigned.txt", "hello", map[string]string{"Content-Type": "text/plain"})
+	server.ServeHTTP(put.recorder, put.request)
+	if put.recorder.Code != http.StatusOK {
+		t.Fatalf("put status = %d body = %s", put.recorder.Code, put.recorder.Body.String())
+	}
+
+	get := signedRecorderRequest(t, http.MethodGet, "/photos/unsigned.txt", "", nil)
+	server.ServeHTTP(get.recorder, get.request)
+	if get.recorder.Code != http.StatusOK || get.recorder.Body.String() != "hello" {
+		t.Fatalf("get status = %d body = %q", get.recorder.Code, get.recorder.Body.String())
+	}
+}
+
+func TestDebugLogsQuoteRequestFieldsAndSanitizeErrors(t *testing.T) {
+	var logs bytes.Buffer
+	server := NewServer(errorPutObjectStore{err: errors.New("bot_token=123456:secret secret_key=plain")}, Options{
+		Region:      "us-east-1",
+		Credentials: map[string]string{"AKID": "SECRET"},
+		Ready:       func() bool { return true },
+		SigV4Clock:  func() time.Time { return time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC) },
+		Logger:      log.New(&logs, "", 0),
+	})
+
+	put := signedUnsignedPayloadRecorderRequest(t, http.MethodPut, "/photos/unsafe.txt", "hello", map[string]string{"Content-Type": "text/plain"})
+	server.ServeHTTP(put.recorder, put.request)
+	if put.recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("put status = %d body = %s", put.recorder.Code, put.recorder.Body.String())
+	}
+
+	output := logs.String()
+	if strings.Contains(output, "123456:secret") || strings.Contains(output, "secret_key=plain") {
+		t.Fatalf("debug log leaked secret: %q", output)
+	}
+	if !strings.Contains(output, `bucket="photos"`) || !strings.Contains(output, `key="unsafe.txt"`) || strings.Contains(output, "bucket=photos") || strings.Contains(output, "key=unsafe.txt") {
+		t.Fatalf("debug log did not quote request fields: %q", output)
+	}
+	if !strings.Contains(output, `path="/photos/unsafe.txt"`) || !strings.Contains(output, `error="bot_token=[redacted] secret_key=[redacted]"`) {
+		t.Fatalf("debug log missing quoted path or sanitized error: %q", output)
+	}
+}
+
 func TestGetObjectRange(t *testing.T) {
 	server := newSignedTestServer(t)
 	put := signedRecorderRequest(t, http.MethodPut, "/photos/letters.txt", "abcdefgh", nil)
@@ -128,11 +175,20 @@ func TestGetObjectInvalidRange(t *testing.T) {
 	}
 }
 
-func TestCreateBucketDisabled(t *testing.T) {
+func TestCreateBucketForConfiguredBucketSucceeds(t *testing.T) {
 	server := newSignedTestServer(t)
 	put := signedRecorderRequest(t, http.MethodPut, "/photos", "", nil)
 	server.ServeHTTP(put.recorder, put.request)
-	if put.recorder.Code != http.StatusNotImplemented || !strings.Contains(put.recorder.Body.String(), "<Code>NotImplemented</Code>") {
+	if put.recorder.Code != http.StatusOK || put.recorder.Body.Len() != 0 {
+		t.Fatalf("status = %d body = %s", put.recorder.Code, put.recorder.Body.String())
+	}
+}
+
+func TestCreateBucketForMissingBucketReturnsNotFound(t *testing.T) {
+	server := newSignedTestServer(t)
+	put := signedRecorderRequest(t, http.MethodPut, "/missing", "", nil)
+	server.ServeHTTP(put.recorder, put.request)
+	if put.recorder.Code != http.StatusNotFound || !strings.Contains(put.recorder.Body.String(), "<Code>NoSuchBucket</Code>") {
 		t.Fatalf("status = %d body = %s", put.recorder.Code, put.recorder.Body.String())
 	}
 }
@@ -342,6 +398,38 @@ func TestReadyzReturnsUnavailableWhenNotReady(t *testing.T) {
 	}
 }
 
+type errorPutObjectStore struct {
+	err error
+}
+
+func (s errorPutObjectStore) ListBuckets(context.Context) ([]metadata.Bucket, error) {
+	return []metadata.Bucket{{Name: "photos", Enabled: true}}, nil
+}
+
+func (s errorPutObjectStore) HeadBucket(context.Context, string) error {
+	return nil
+}
+
+func (s errorPutObjectStore) PutObject(context.Context, store.PutObjectInput) (store.PutObjectResult, error) {
+	return store.PutObjectResult{}, s.err
+}
+
+func (s errorPutObjectStore) GetObject(context.Context, store.GetObjectInput) (io.ReadCloser, store.ObjectInfo, error) {
+	return nil, store.ObjectInfo{}, store.ErrNoSuchKey
+}
+
+func (s errorPutObjectStore) HeadObject(context.Context, string, string) (store.ObjectInfo, error) {
+	return store.ObjectInfo{}, store.ErrNoSuchKey
+}
+
+func (s errorPutObjectStore) ListObjects(context.Context, store.ListObjectsInput) (store.ListObjectsResult, error) {
+	return store.ListObjectsResult{}, nil
+}
+
+func (s errorPutObjectStore) DeleteObject(context.Context, string, string) error {
+	return nil
+}
+
 type signedHTTPTest struct {
 	recorder *httptest.ResponseRecorder
 	request  *http.Request
@@ -376,6 +464,17 @@ func signedRecorderRequest(t *testing.T, method, path, body string, headers map[
 	}
 	sum := sha256.Sum256([]byte(body))
 	request.Header.Set("X-Amz-Content-Sha256", hex.EncodeToString(sum[:]))
+	signRequest(t, request, "AKID", "SECRET")
+	return signedHTTPTest{recorder: httptest.NewRecorder(), request: request}
+}
+
+func signedUnsignedPayloadRecorderRequest(t *testing.T, method, path, body string, headers map[string]string) signedHTTPTest {
+	t.Helper()
+	request := httptest.NewRequest(method, path, strings.NewReader(body))
+	for name, value := range headers {
+		request.Header.Set(name, value)
+	}
+	request.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
 	signRequest(t, request, "AKID", "SECRET")
 	return signedHTTPTest{recorder: httptest.NewRecorder(), request: request}
 }

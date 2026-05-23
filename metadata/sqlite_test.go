@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -443,6 +444,49 @@ func TestSQLiteListBucketsSkipsDisabled(t *testing.T) {
 	}
 	if got[0].Name != "beta" {
 		t.Fatalf("bucket name = %q", got[0].Name)
+	}
+}
+
+func TestOpenSQLiteReadOnlyOpensExistingDatabaseWithoutWrites(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "metadata.sqlite")
+	writable, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatalf("OpenSQLite returned error: %v", err)
+	}
+	if err := writable.UpsertBucket(t.Context(), Bucket{Name: "photos", ChatID: "-100", CreatedAt: time.Unix(10, 0), Enabled: true}); err != nil {
+		t.Fatalf("UpsertBucket returned error: %v", err)
+	}
+	if err := writable.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	readonly, err := OpenSQLiteReadOnly(path)
+	if err != nil {
+		t.Fatalf("OpenSQLiteReadOnly returned error: %v", err)
+	}
+	defer readonly.Close()
+
+	buckets, err := readonly.ListBuckets(t.Context())
+	if err != nil {
+		t.Fatalf("ListBuckets returned error: %v", err)
+	}
+	if len(buckets) != 1 || buckets[0].Name != "photos" {
+		t.Fatalf("buckets = %+v", buckets)
+	}
+	if err := readonly.UpsertBucket(t.Context(), Bucket{Name: "backups", ChatID: "-200", CreatedAt: time.Unix(20, 0), Enabled: true}); err == nil {
+		t.Fatal("expected read-only UpsertBucket error")
+	}
+}
+
+func TestOpenSQLiteReadOnlyDoesNotCreateMissingDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.sqlite")
+	store, err := OpenSQLiteReadOnly(path)
+	if err == nil {
+		_ = store.Close()
+		t.Fatal("expected OpenSQLiteReadOnly error")
+	}
+	if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("sqlite path was created or stat failed unexpectedly: %v", statErr)
 	}
 }
 

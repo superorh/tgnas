@@ -1,0 +1,45 @@
+server:
+  # listen: ":9000"
+  # If set and the environment variable is non-empty, it overrides listen.
+  # listen_env: "TGS3_LISTEN"
+  # Public URL used when the service needs to describe its external endpoint.
+  # public_base_url: "https://s3.example.com"
+
+auth:
+  # region: "us-east-1"
+  credentials:
+    - access_key: "admin"
+      secret_key_env: "TGS3_SECRET_KEY"
+
+telegram:
+  bot_token_env: "TELEGRAM_BOT_TOKEN"
+  # api_base_url: "https://api.telegram.org"
+  # caption_template: "{bucket}/{key}"
+  # timeout: "30s"
+
+metadata:
+  # sqlite_path: "data/metadata.sqlite"
+  # If set and the environment variable is non-empty, it overrides sqlite_path.
+  # sqlite_path_env: "TGS3_SQLITE_PATH"
+
+storage:
+  # upload_type_strategy: "document"
+  # enable_chunking: true
+  # max_file_size: 52428800
+  # chunk_size: 20971520
+  # type_size_limits:
+  #   photo: 10485760
+  #   video: 20971520
+  #   audio: 20971520
+  #   animation: 20971520
+  #   document: 20971520
+  # max_concurrent_uploads: 4
+  # max_concurrent_downloads: 16
+  # max_concurrent_telegram_requests: 8
+  # put_buffer_size: 1048576
+
+buckets:
+  mybucket:
+    chat_id: "-1001234567890"
+  # private:
+  #   chat_id: "${TGS3_PRIVATE_CHAT_ID}"

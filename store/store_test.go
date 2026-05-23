@@ -213,6 +213,9 @@ func TestStoreLogsOrphanUploadWhenMetadataCommitFails(t *testing.T) {
 	if !strings.Contains(output, "orphan_upload") || !strings.Contains(output, `bucket="photos"`) || !strings.Contains(output, `key="hello.txt"`) {
 		t.Fatalf("log output = %q", output)
 	}
+	if !strings.Contains(output, `event=metadata_put_object bucket="photos" key="hello.txt" chunk_count=1`) || !strings.Contains(output, `result=error`) {
+		t.Fatalf("metadata failure log output = %q", output)
+	}
 	if !strings.Contains(output, "metadata commit failed") || !strings.Contains(output, "detail=retryable") {
 		t.Fatalf("log lost useful diagnostics: %q", output)
 	}
@@ -256,11 +259,14 @@ func TestStoreLogsOrphanUploadWhenChunkedUploadFailsAfterEarlierChunks(t *testin
 		t.Fatalf("PutObject err = %v, want %v", err, uploadErr)
 	}
 	output := logs.String()
+	if !strings.Contains(output, `event=put_object_decision bucket="backups" key="big.bin" size=6`) || !strings.Contains(output, `chunked=true`) || !strings.Contains(output, `chunk_size=3`) || !strings.Contains(output, `chunk_count=2`) {
+		t.Fatalf("decision log output = %q", output)
+	}
 	if !strings.Contains(output, "orphan_upload") || !strings.Contains(output, `bucket="backups"`) || !strings.Contains(output, `key="big.bin"`) {
 		t.Fatalf("log output = %q", output)
 	}
-	if !strings.Contains(output, "file_id=chunk-file-1 message_id=101") {
-		t.Fatalf("log missing uploaded chunk details: %q", output)
+	if !strings.Contains(output, "file_id=chun...le-1 message_id=101") {
+		t.Fatalf("log missing redacted uploaded chunk details: %q", output)
 	}
 	if strings.Contains(output, "456") || strings.Contains(output, "123") {
 		t.Fatalf("log leaked secret material: %q", output)
@@ -537,6 +543,29 @@ func TestStoreMaxDownloadsSerializationWhenSetToOne(t *testing.T) {
 	}
 	if maxConcurrent.Load() != 1 {
 		t.Fatalf("max concurrent downloads = %d", maxConcurrent.Load())
+	}
+}
+
+func TestStoreLogsPutObjectDecisionForSingleUpload(t *testing.T) {
+	ctx := context.Background()
+	meta, err := metadata.OpenSQLite(filepath.Join(t.TempDir(), "metadata.sqlite"))
+	if err != nil {
+		t.Fatalf("OpenSQLite returned error: %v", err)
+	}
+	defer meta.Close()
+	if err := meta.UpsertBucket(ctx, metadata.Bucket{Name: "photos", ChatID: "-100", CreatedAt: time.Now().UTC(), Enabled: true}); err != nil {
+		t.Fatalf("UpsertBucket returned error: %v", err)
+	}
+	var logs bytes.Buffer
+	store := mustNewObjectStore(t, meta, testutil.NewFakeTelegram(), Options{Upload: DefaultUploadConfig(), Logger: log.New(&logs, "", 0)})
+
+	_, err = store.PutObject(ctx, PutObjectInput{Bucket: "photos", Key: "hello.txt", ContentType: "text/plain", Size: 5, Body: strings.NewReader("hello")})
+	if err != nil {
+		t.Fatalf("PutObject returned error: %v", err)
+	}
+	output := logs.String()
+	if !strings.Contains(output, `event=put_object_decision bucket="photos" key="hello.txt" size=5`) || !strings.Contains(output, `telegram_type="document"`) || !strings.Contains(output, `strategy="document"`) || !strings.Contains(output, `chunked=false`) || !strings.Contains(output, `chunk_size=0`) || !strings.Contains(output, `chunk_count=1`) {
+		t.Fatalf("decision log output = %q", output)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"net/url"
 	"strings"
 	"time"
 
@@ -15,18 +16,39 @@ type SQLiteStore struct {
 }
 
 func OpenSQLite(path string) (*SQLiteStore, error) {
-	db, err := sql.Open("sqlite", path)
+	store, err := openSQLite(path)
 	if err != nil {
 		return nil, err
 	}
-
-	store := &SQLiteStore{db: db}
 	if err := store.migrate(); err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+func OpenSQLiteReadOnly(path string) (*SQLiteStore, error) {
+	return openSQLite(sqliteReadOnlyDSN(path))
+}
+
+func openSQLite(dataSourceName string) (*SQLiteStore, error) {
+	db, err := sql.Open("sqlite", dataSourceName)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
+	return &SQLiteStore{db: db}, nil
+}
 
-	return store, nil
+func sqliteReadOnlyDSN(path string) string {
+	u := url.URL{Scheme: "file", Path: path}
+	query := u.Query()
+	query.Set("mode", "ro")
+	u.RawQuery = query.Encode()
+	return u.String()
 }
 
 func (s *SQLiteStore) Close() error {

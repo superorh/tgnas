@@ -5,8 +5,10 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -31,12 +33,14 @@ type Options struct {
 	Ready        func() bool
 	SigV4Clock   func() time.Time
 	SigV4MaxSkew time.Duration
+	Logger       *log.Logger
 }
 
 type Server struct {
 	store  ObjectStore
 	ready  func() bool
 	verify *SigV4Verifier
+	logger *log.Logger
 }
 
 func NewServer(objectStore ObjectStore, options Options) http.Handler {
@@ -51,10 +55,15 @@ func NewServer(objectStore ObjectStore, options Options) http.Handler {
 	if options.SigV4MaxSkew != 0 {
 		verifierOptions = append(verifierOptions, WithSigV4MaxSkew(options.SigV4MaxSkew))
 	}
+	logger := options.Logger
+	if logger == nil {
+		logger = log.New(io.Discard, "", 0)
+	}
 	return &Server{
 		store:  objectStore,
 		ready:  ready,
 		verify: NewSigV4Verifier(options.Region, options.Credentials, verifierOptions...),
+		logger: logger,
 	}
 }
 
@@ -88,6 +97,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.Header.Get("X-Amz-Content-Sha256") == "UNSIGNED-PAYLOAD" {
+		s.logger.Printf("debug event=s3_unsigned_payload method=%q path=%q accepted=true", r.Method, r.URL.Path)
+	}
 	if _, err := s.verify.Verify(r); err != nil {
 		WriteErrorResponse(w, r, MapError(err), r.URL.Path, "")
 		return
@@ -180,7 +192,13 @@ func splitPath(u *url.URL) (bucket, key string, hasBucket bool) {
 func (s *Server) handleBucket(w http.ResponseWriter, r *http.Request, bucket string) {
 	switch r.Method {
 	case http.MethodPut:
-		WriteErrorResponse(w, r, ErrNotImplemented, r.URL.Path, "")
+		if err := s.store.HeadBucket(r.Context(), bucket); err != nil {
+			s.logger.Printf("debug event=s3_create_bucket bucket=%q result=error error=%q", bucket, sanitizeLogError(err))
+			WriteErrorResponse(w, r, MapError(err), r.URL.Path, "")
+			return
+		}
+		s.logger.Printf("debug event=s3_create_bucket bucket=%q result=success", bucket)
+		w.WriteHeader(http.StatusOK)
 	case http.MethodHead:
 		if err := s.store.HeadBucket(r.Context(), bucket); err != nil {
 			WriteErrorResponse(w, r, MapError(err), r.URL.Path, "")
@@ -299,6 +317,11 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		WriteErrorResponse(w, r, ErrMissingContentLength, r.URL.Path, "")
 		return
 	}
+	payloadHashMode := "sha256"
+	if r.Header.Get("X-Amz-Content-Sha256") == "UNSIGNED-PAYLOAD" {
+		payloadHashMode = "unsigned"
+	}
+	s.logger.Printf("debug event=s3_put_object_request bucket=%q key=%q content_length=%d content_type=%q payload_hash_mode=%q", bucket, key, r.ContentLength, r.Header.Get("Content-Type"), payloadHashMode)
 	result, err := s.store.PutObject(r.Context(), store.PutObjectInput{
 		Bucket:      bucket,
 		Key:         key,
@@ -307,12 +330,23 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		Body:        r.Body,
 	})
 	if err != nil {
+		s.logger.Printf("debug event=s3_put_object_result bucket=%q key=%q result=error error=%q", bucket, key, sanitizeLogError(err))
 		WriteErrorResponse(w, r, MapError(err), r.URL.Path, "")
 		return
 	}
+	s.logger.Printf("debug event=s3_put_object_result bucket=%q key=%q result=success etag=%q", bucket, key, result.ETag)
 	w.Header().Set("ETag", fmt.Sprintf("\"%s\"", result.ETag))
 	w.WriteHeader(http.StatusOK)
 }
+
+func sanitizeLogError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return sensitiveAssignmentPattern.ReplaceAllString(err.Error(), "$1$2[redacted]")
+}
+
+var sensitiveAssignmentPattern = regexp.MustCompile(`(?i)\b(bot_token|secret_key)\b\s*([=:])\s*([^\s,;]+)`)
 
 func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	var requestedRange *store.ByteRange

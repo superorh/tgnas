@@ -181,7 +181,7 @@ func payloadHash(r *http.Request) (string, error) {
 		return hash, nil
 	}
 	if hash == "UNSIGNED-PAYLOAD" {
-		return "", fmt.Errorf("unsigned payload unsupported")
+		return hash, nil
 	}
 
 	body, err := io.ReadAll(r.Body)
