@@ -1,0 +1,9 @@
+.git
+.claude
+.agents
+vendor
+*.sqlite
+*.db
+**/*.sqlite
+**/*.db
+docs/superpowers/
