@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aahl/tgs3/metadata"
-	"github.com/aahl/tgs3/telegram"
+	"github.com/aahl/tgnas/metadata"
+	"github.com/aahl/tgnas/telegram"
 )
 
 type ObjectStore struct {
@@ -105,6 +105,20 @@ func (s *ObjectStore) HeadBucket(ctx context.Context, name string) error {
 	return nil
 }
 
+func (s *ObjectStore) DeleteBucket(ctx context.Context, name string) error {
+	bucket, err := s.meta.GetBucket(ctx, name)
+	if err != nil {
+		if errors.Is(err, metadata.ErrNotFound) {
+			return ErrNoSuchBucket
+		}
+		return err
+	}
+	if bucket.Enabled {
+		return ErrNotImplemented
+	}
+	return s.meta.DeleteBucket(ctx, name)
+}
+
 func (s *ObjectStore) PutObject(ctx context.Context, input PutObjectInput) (PutObjectResult, error) {
 	if input.Size < 0 {
 		return PutObjectResult{}, ErrMissingContentLength
@@ -140,6 +154,9 @@ func (s *ObjectStore) PutObject(ctx context.Context, input PutObjectInput) (PutO
 	}
 	s.logger.Printf("debug event=put_object_decision bucket=%q key=%q size=%d telegram_type=%q strategy=%q chunked=%t chunk_size=%d chunk_count=%d", input.Bucket, input.Key, input.Size, strategy.TelegramType, strategy.UploadStrategy, strategy.Chunked, chunkSize, chunkCount)
 
+	if input.Size == 0 {
+		return s.putEmpty(ctx, input, strategy)
+	}
 	if !strategy.Chunked {
 		limit := s.options.Upload.TypeLimits[strategy.TelegramType]
 		if limit > 0 && input.Size > limit {
@@ -405,6 +422,29 @@ func HumanSize(size int64) string {
 		}
 	}
 	return fmt.Sprintf("%.1f PiB", value/1024)
+}
+
+func (s *ObjectStore) putEmpty(ctx context.Context, input PutObjectInput, strategy UploadStrategy) (PutObjectResult, error) {
+	etag := hex.EncodeToString(md5.New().Sum(nil))
+	shaSum := hex.EncodeToString(sha256.New().Sum(nil))
+	object := metadata.Object{
+		Bucket:         input.Bucket,
+		Key:            input.Key,
+		Size:           0,
+		ContentType:    input.ContentType,
+		ETag:           etag,
+		SHA256:         shaSum,
+		LastModified:   time.Now().UTC(),
+		ChunkCount:     0,
+		TelegramType:   strategy.TelegramType,
+		UploadStrategy: strategy.UploadStrategy,
+	}
+	if err := s.meta.PutObject(ctx, object, nil); err != nil {
+		s.logMetadataPutObject(input.Bucket, input.Key, 0, etag, err)
+		return PutObjectResult{}, err
+	}
+	s.logMetadataPutObject(input.Bucket, input.Key, 0, etag, nil)
+	return PutObjectResult{ETag: etag}, nil
 }
 
 func (s *ObjectStore) putSingle(ctx context.Context, input PutObjectInput, strategy UploadStrategy) (PutObjectResult, error) {

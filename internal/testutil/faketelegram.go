@@ -7,16 +7,16 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/aahl/tgs3/telegram"
+	"github.com/aahl/tgnas/telegram"
 )
 
 type FakeTelegram struct {
-	mu            sync.Mutex
-	Uploads       []telegram.UploadRequest
-	Downloads     []string
-	Files         map[string]string
-	UploadFunc    func(context.Context, telegram.UploadRequest) (telegram.UploadedFile, error)
-	DownloadFunc  func(context.Context, string) (io.ReadCloser, error)
+	mu           sync.Mutex
+	Uploads      []telegram.UploadRequest
+	Downloads    []string
+	Files        map[string]string
+	UploadFunc   func(context.Context, telegram.UploadRequest) (telegram.UploadedFile, error)
+	DownloadFunc func(context.Context, string) (io.ReadCloser, error)
 }
 
 func NewFakeTelegram() *FakeTelegram {

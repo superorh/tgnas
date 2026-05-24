@@ -5,7 +5,7 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/aahl/tgs3/store"
+	"github.com/aahl/tgnas/store"
 )
 
 var (

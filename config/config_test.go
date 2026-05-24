@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -17,14 +18,14 @@ auth:
   region: "us-east-1"
   credentials:
     - access_key: "admin"
-      secret_key_env: "TGS3_TEST_SECRET"
+      secret_key_env: "TGNAS_TEST_SECRET"
 telegram:
-  bot_token_env: "TGS3_TEST_BOT_TOKEN"
+  bot_token_env: "TGNAS_TEST_BOT_TOKEN"
   api_base_url: "https://api.telegram.org"
   timeout: "45s"
 metadata:
   driver: "sqlite"
-  sqlite_path: "/tmp/tgs3.sqlite"
+  sqlite_path: "/tmp/tgnas.sqlite"
 storage:
   upload_type_strategy: "document"
 buckets:
@@ -34,8 +35,8 @@ buckets:
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("TGS3_TEST_SECRET", "secret")
-	t.Setenv("TGS3_TEST_BOT_TOKEN", "bot-token")
+	t.Setenv("TGNAS_TEST_SECRET", "secret")
+	t.Setenv("TGNAS_TEST_BOT_TOKEN", "bot-token")
 
 	cfg, err := LoadFile(path)
 	if err != nil {
@@ -80,7 +81,7 @@ telegram:
   api_base_url: "https://api.telegram.org"
 metadata:
   driver: "sqlite"
-  sqlite_path: "/tmp/tgs3.sqlite"
+  sqlite_path: "/tmp/tgnas.sqlite"
 storage:
   upload_type_strategy: "document"
   enable_chunking: false
@@ -151,7 +152,7 @@ buckets:
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("TGS3_LISTEN", "127.0.0.1:12345")
+	t.Setenv("TGNAS_LISTEN", "127.0.0.1:12345")
 
 	cfg, err := LoadFile(path)
 	if err != nil {
@@ -163,13 +164,13 @@ buckets:
 }
 
 func TestSQLitePathEnvPrecedence(t *testing.T) {
-	t.Setenv("TGS3_SQLITE_PATH", "/env/tgs3.sqlite")
-	cfg := Config{Metadata: MetadataConfig{Driver: "sqlite", SQLitePath: "/file/tgs3.sqlite", SQLitePathEnv: "TGS3_SQLITE_PATH"}}
+	t.Setenv("TGNAS_SQLITE_PATH", "/env/tgnas.sqlite")
+	cfg := Config{Metadata: MetadataConfig{Driver: "sqlite", SQLitePath: "/file/tgnas.sqlite", SQLitePathEnv: "TGNAS_SQLITE_PATH"}}
 	got, err := cfg.ResolveSQLitePath()
 	if err != nil {
 		t.Fatalf("ResolveSQLitePath returned error: %v", err)
 	}
-	if got != "/env/tgs3.sqlite" {
+	if got != "/env/tgnas.sqlite" {
 		t.Fatalf("path = %q", got)
 	}
 }
@@ -208,7 +209,7 @@ telegram:
   caption_template: "{{.Name}}"
 metadata:
   driver: "sqlite"
-  sqlite_path: "/tmp/tgs3.sqlite"
+  sqlite_path: "/tmp/tgnas.sqlite"
 storage:
   upload_type_strategy: "document"
   type_size_limits:
@@ -260,7 +261,7 @@ telegram:
   api_base_url: "https://api.telegram.org"
 metadata:
   driver: "sqlite"
-  sqlite_path: "/tmp/tgs3.sqlite"
+  sqlite_path: "/tmp/tgnas.sqlite"
 storage:
   upload_strategy: "document"
 buckets:
@@ -305,12 +306,12 @@ telegram:
   bot_token_env: "BOT_TOKEN"
 buckets:
   photos:
-    chat_id: "${TGS3_PHOTOS_CHAT_ID}"
+    chat_id: "${TGNAS_PHOTOS_CHAT_ID}"
 `), 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("TGS3_PHOTOS_CHAT_ID", "-100999")
+	t.Setenv("TGNAS_PHOTOS_CHAT_ID", "-100999")
 
 	cfg, err := LoadFile(path)
 	if err != nil {
@@ -333,12 +334,12 @@ telegram:
   bot_token_env: "BOT_TOKEN"
 buckets:
   photos:
-    chat_id: "prefix-${TGS3_PHOTOS_CHAT_ID}"
+    chat_id: "prefix-${TGNAS_PHOTOS_CHAT_ID}"
 `), 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("TGS3_PHOTOS_CHAT_ID", "123")
+	t.Setenv("TGNAS_PHOTOS_CHAT_ID", "123")
 
 	_, err = LoadFile(path)
 	if err == nil {
@@ -358,12 +359,12 @@ telegram:
   bot_token_env: "BOT_TOKEN"
 buckets:
   photos:
-    chat_id: "${TGS3_MISSING_CHAT_ID}"
+    chat_id: "${TGNAS_MISSING_CHAT_ID}"
 `), 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("TGS3_MISSING_CHAT_ID", "")
+	t.Setenv("TGNAS_MISSING_CHAT_ID", "")
 
 	_, err = LoadFile(path)
 	if err == nil {
@@ -376,8 +377,51 @@ func minimalValidConfig() Config {
 		Server:   ServerConfig{Listen: ":9000"},
 		Auth:     AuthConfig{Region: "us-east-1", Credentials: []CredentialConfig{{AccessKey: "admin", SecretKeyEnv: "SECRET"}}},
 		Telegram: TelegramConfig{BotTokenEnv: "BOT_TOKEN", APIBaseURL: "https://api.telegram.org", Timeout: 30 * time.Second},
-		Metadata: MetadataConfig{Driver: "sqlite", SQLitePath: "/tmp/tgs3.sqlite"},
+		Metadata: MetadataConfig{Driver: "sqlite", SQLitePath: "/tmp/tgnas.sqlite"},
 		Storage:  DefaultStorageConfig(),
 		Buckets:  map[string]BucketConfig{"photos": {ChatID: "-100123"}},
+	}
+}
+
+func TestWebDAVPrefixDefault(t *testing.T) {
+	cfg := Config{WebDAV: WebDAVConfig{}}
+	cfg.applyWebDAVDefaults()
+	if cfg.WebDAV.Prefix != "/dav/" {
+		t.Fatalf("expected default prefix /dav/, got %q", cfg.WebDAV.Prefix)
+	}
+}
+
+func TestWebDAVPrefixNormalizesTrailingSlash(t *testing.T) {
+	cfg := Config{WebDAV: WebDAVConfig{Prefix: "/dav"}}
+	cfg.applyWebDAVDefaults()
+	if cfg.WebDAV.Prefix != "/dav/" {
+		t.Fatalf("expected /dav/, got %q", cfg.WebDAV.Prefix)
+	}
+}
+
+func TestWebDAVPrefixRejectsRoot(t *testing.T) {
+	cfg := Config{WebDAV: WebDAVConfig{Prefix: "/"}}
+	err := cfg.validateWebDAV()
+	if err == nil || !strings.Contains(err.Error(), "cannot be /") {
+		t.Fatalf("expected root prefix rejected, got %v", err)
+	}
+}
+
+func TestWebDAVPrefixRejectsMissingLeadingSlash(t *testing.T) {
+	cfg := Config{WebDAV: WebDAVConfig{Prefix: "dav/"}}
+	err := cfg.validateWebDAV()
+	if err == nil || !strings.Contains(err.Error(), "must start with /") {
+		t.Fatalf("expected missing leading slash rejected, got %v", err)
+	}
+}
+
+func TestWebDAVPrefixRejectsBucketNameConflict(t *testing.T) {
+	cfg := Config{
+		Buckets: map[string]BucketConfig{"photos": {ChatID: "123"}},
+		WebDAV:  WebDAVConfig{Prefix: "/photos/"},
+	}
+	err := cfg.validateWebDAV()
+	if err == nil || !strings.Contains(err.Error(), "conflicts with bucket") {
+		t.Fatalf("expected bucket conflict rejected, got %v", err)
 	}
 }

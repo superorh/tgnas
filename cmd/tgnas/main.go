@@ -14,11 +14,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/aahl/tgs3/config"
-	"github.com/aahl/tgs3/internal/s3api"
-	"github.com/aahl/tgs3/metadata"
-	"github.com/aahl/tgs3/store"
-	"github.com/aahl/tgs3/telegram"
+	"github.com/aahl/tgnas/config"
+	"github.com/aahl/tgnas/internal/dav"
+	"github.com/aahl/tgnas/internal/s3api"
+	"github.com/aahl/tgnas/metadata"
+	"github.com/aahl/tgnas/store"
+	"github.com/aahl/tgnas/telegram"
 	"gopkg.in/yaml.v3"
 )
 
@@ -33,15 +34,26 @@ func validateBotToken(token string) error {
 	return nil
 }
 
+type serverMode string
+
+const (
+	serverModeAll serverMode = "all"
+	serverModeS3  serverMode = "s3"
+	serverModeDAV serverMode = "dav"
+)
+
 const defaultConfigPath = "data/config.yaml"
 
 const topLevelUsage = "Usage:\n" +
-	"  tgs3 [-debug] [-c|-config config.yaml]\n" +
-	"  tgs3 [-debug] [-c|-config config.yaml] ls [-n|-limit N] bucket[/prefix]\n" +
-	"  tgs3 [-debug] [-c|-config config.yaml] lsd [bucket[/prefix]]\n"
+	"  tgnas [-debug] [-c|-config config.yaml]\n" +
+	"  tgnas [-debug] [-c|-config config.yaml] s3\n" +
+	"  tgnas [-debug] [-c|-config config.yaml] dav\n" +
+	"  tgnas [-debug] [-c|-config config.yaml] ls [-n|-limit N] bucket[/prefix]\n" +
+	"  tgnas [-debug] [-c|-config config.yaml] lsd [bucket[/prefix]]\n"
 
 var newObjectStore = store.NewObjectStore
 var listenAndServe = http.ListenAndServe
+var runServiceFunc = runServiceWithDebug
 
 var errHelpRequested = errors.New("help requested")
 
@@ -93,11 +105,17 @@ func runMain(args []string, stdout, stderr io.Writer) error {
 		dbg.Printf("config_path=%q", configPath)
 	}
 	if len(rest) == 0 {
-		dbg.Printf("mode=service")
-		return runWithDebug(configPath, dbg)
+		dbg.Printf("mode=all")
+		return runServiceFunc(configPath, serverModeAll, dbg)
 	}
 
 	switch rest[0] {
+	case "s3":
+		dbg.Printf("mode=s3")
+		return runServiceFunc(configPath, serverModeS3, dbg)
+	case "dav":
+		dbg.Printf("mode=dav")
+		return runServiceFunc(configPath, serverModeDAV, dbg)
 	case "ls":
 		dbg.Printf("mode=ls")
 		return runLS(configPath, rest[1:], stdout, stderr, dbg)
@@ -110,7 +128,7 @@ func runMain(args []string, stdout, stderr io.Writer) error {
 }
 
 func parseGlobalFlags(args []string, stderr io.Writer) (string, bool, []string, error) {
-	fs := flag.NewFlagSet("tgs3", flag.ContinueOnError)
+	fs := flag.NewFlagSet("tgnas", flag.ContinueOnError)
 	if stderr == nil {
 		stderr = io.Discard
 	}
@@ -421,15 +439,69 @@ func requireEnabledBucket(ctx context.Context, meta metadata.Store, bucket strin
 }
 
 func run(configPath string) error {
-	return runWithDebug(configPath, newDebugLogger(false, io.Discard))
+	return runServiceWithDebug(configPath, serverModeAll, newDebugLogger(false, io.Discard))
 }
 
-func runWithDebug(configPath string, dbg debugLogger) error {
+type combinedHandler struct {
+	s3      http.Handler
+	dav     http.Handler
+	prefix  string
+	davOnly bool
+}
+
+func newCombinedHandler(s3Handler, davHandler http.Handler, prefix string) http.Handler {
+	return &combinedHandler{s3: s3Handler, dav: davHandler, prefix: prefix}
+}
+
+func newDAVOnlyHandler(s3Handler, davHandler http.Handler, prefix string) http.Handler {
+	return &combinedHandler{s3: s3Handler, dav: davHandler, prefix: prefix, davOnly: true}
+}
+
+func (h *combinedHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+		h.s3.ServeHTTP(w, r)
+		return
+	}
+	if r.URL.Path == strings.TrimSuffix(h.prefix, "/") {
+		http.Redirect(w, r, h.prefix, http.StatusPermanentRedirect)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, h.prefix) {
+		h.dav.ServeHTTP(w, r)
+		return
+	}
+	if h.davOnly {
+		http.NotFound(w, r)
+		return
+	}
+	h.s3.ServeHTTP(w, r)
+}
+
+func runServiceWithDebug(configPath string, mode serverMode, dbg debugLogger) error {
 	var ready atomic.Bool
 
 	cfg, err := config.LoadFile(configPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
+	}
+
+	botToken := cfg.ResolveBotToken()
+	if err := validateBotToken(botToken); err != nil {
+		return fmt.Errorf("validate bot token: %w", err)
+	}
+
+	caption, err := telegram.ParseCaptionTemplate(cfg.Telegram.CaptionTemplate)
+	if err != nil {
+		return fmt.Errorf("parse caption template: %w", err)
+	}
+
+	secrets := map[string]string{}
+	for _, credential := range cfg.Auth.Credentials {
+		secret := cfg.ResolveSecret(credential.SecretKeyEnv)
+		if strings.TrimSpace(secret) == "" {
+			return fmt.Errorf("resolve secret for access key %s: environment variable %s is empty", credential.AccessKey, credential.SecretKeyEnv)
+		}
+		secrets[credential.AccessKey] = secret
 	}
 
 	sqlitePath, err := cfg.ResolveSQLitePath()
@@ -445,8 +517,10 @@ func runWithDebug(configPath string, dbg debugLogger) error {
 	defer meta.Close()
 
 	ctx := context.Background()
+	var configuredNames []string
 	for name, bucket := range cfg.Buckets {
 		dbg.Printf("bucket=%q upsert=configured", name)
+		configuredNames = append(configuredNames, name)
 		if err := meta.UpsertBucket(ctx, metadata.Bucket{
 			Name:      name,
 			ChatID:    bucket.ChatID,
@@ -456,15 +530,8 @@ func runWithDebug(configPath string, dbg debugLogger) error {
 			return fmt.Errorf("upsert bucket %s: %w", name, err)
 		}
 	}
-
-	botToken := cfg.ResolveBotToken()
-	if err := validateBotToken(botToken); err != nil {
-		return fmt.Errorf("validate bot token: %w", err)
-	}
-
-	caption, err := telegram.ParseCaptionTemplate(cfg.Telegram.CaptionTemplate)
-	if err != nil {
-		return fmt.Errorf("parse caption template: %w", err)
+	if err := meta.DisableBucketsExcept(ctx, configuredNames); err != nil {
+		return fmt.Errorf("disable removed buckets: %w", err)
 	}
 
 	tg := telegram.NewHTTPClient(botToken, cfg.Telegram.APIBaseURL, &http.Client{Timeout: cfg.Telegram.Timeout})
@@ -487,28 +554,38 @@ func runWithDebug(configPath string, dbg debugLogger) error {
 		return fmt.Errorf("create object store: %w", err)
 	}
 
-	secrets := map[string]string{}
-	for _, credential := range cfg.Auth.Credentials {
-		secret := cfg.ResolveSecret(credential.SecretKeyEnv)
-		if strings.TrimSpace(secret) == "" {
-			return fmt.Errorf("resolve secret for access key %s: environment variable %s is empty", credential.AccessKey, credential.SecretKeyEnv)
-		}
-		secrets[credential.AccessKey] = secret
-	}
-
 	ready.Store(true)
 
-	server := s3api.NewServer(objectStore, s3api.Options{
+	var handler http.Handler
+	s3Handler := s3api.NewServer(objectStore, s3api.Options{
 		Region:      cfg.Auth.Region,
 		Credentials: secrets,
 		Ready:       ready.Load,
 		Logger:      dbg.StdLogger(),
 	})
+	if mode == serverModeS3 {
+		handler = s3Handler
+	} else {
+		fs := dav.NewFileSystem(meta, objectStore)
+		davHandler := dav.NewHandler(meta, fs, dav.HandlerOptions{
+			Prefix:      cfg.WebDAV.Prefix,
+			Credentials: secrets,
+			Logger:      dbg.StdLogger(),
+		})
+		switch mode {
+		case serverModeAll:
+			handler = newCombinedHandler(s3Handler, davHandler, cfg.WebDAV.Prefix)
+		case serverModeDAV:
+			handler = newDAVOnlyHandler(s3Handler, davHandler, cfg.WebDAV.Prefix)
+		default:
+			return fmt.Errorf("unknown server mode: %s", mode)
+		}
+	}
 
 	listenAddr := cfg.ResolveListen()
-	dbg.Printf("listen_addr=%q", listenAddr)
-	log.Printf("listening on %s", listenAddr)
-	if err := listenAndServe(listenAddr, server); err != nil {
+	dbg.Printf("listen_addr=%q mode=%q webdav_prefix=%q", listenAddr, mode, cfg.WebDAV.Prefix)
+	log.Printf("listening on %s (mode=%s)", listenAddr, mode)
+	if err := listenAndServe(listenAddr, handler); err != nil {
 		return err
 	}
 	return nil

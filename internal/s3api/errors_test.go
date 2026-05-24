@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/aahl/tgs3/store"
+	"github.com/aahl/tgnas/store"
 )
 
 func TestWriteErrorXML(t *testing.T) {

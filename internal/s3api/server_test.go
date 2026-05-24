@@ -19,9 +19,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 
-	"github.com/aahl/tgs3/internal/testutil"
-	"github.com/aahl/tgs3/metadata"
-	"github.com/aahl/tgs3/store"
+	"github.com/aahl/tgnas/internal/testutil"
+	"github.com/aahl/tgnas/metadata"
+	"github.com/aahl/tgnas/store"
 )
 
 func TestRootNegotiationDefaultsToS3ListBuckets(t *testing.T) {
@@ -207,6 +207,66 @@ func TestHeadBucket(t *testing.T) {
 	if missing.recorder.Code != http.StatusNotFound || missing.recorder.Body.Len() != 0 {
 		t.Fatalf("missing status = %d body = %q", missing.recorder.Code, missing.recorder.Body.String())
 	}
+}
+
+func TestDeleteBucketRemovesOrphanBucketMetadata(t *testing.T) {
+	ctx := context.Background()
+	meta, server := newBucketDeleteTestServer(t)
+	if err := meta.PutObject(ctx, metadata.Object{Bucket: "archive", Key: "old.txt", Size: 3, LastModified: time.Now().UTC()}, nil); err != nil {
+		t.Fatalf("PutObject returned error: %v", err)
+	}
+
+	deleteReq := signedRecorderRequest(t, http.MethodDelete, "/archive", "", nil)
+	server.ServeHTTP(deleteReq.recorder, deleteReq.request)
+	if deleteReq.recorder.Code != http.StatusNoContent {
+		t.Fatalf("delete status = %d body = %s", deleteReq.recorder.Code, deleteReq.recorder.Body.String())
+	}
+	if _, err := meta.GetBucket(ctx, "archive"); !errors.Is(err, metadata.ErrNotFound) {
+		t.Fatalf("GetBucket archive err = %v, want ErrNotFound", err)
+	}
+	objects, err := meta.ListObjects(ctx, metadata.ListQuery{Bucket: "archive", Limit: 10})
+	if err != nil {
+		t.Fatalf("ListObjects returned error: %v", err)
+	}
+	if len(objects) != 0 {
+		t.Fatalf("archive objects = %d, want 0", len(objects))
+	}
+}
+
+func TestDeleteBucketRejectsConfiguredBucket(t *testing.T) {
+	ctx := context.Background()
+	meta, server := newBucketDeleteTestServer(t)
+
+	deleteReq := signedRecorderRequest(t, http.MethodDelete, "/photos", "", nil)
+	server.ServeHTTP(deleteReq.recorder, deleteReq.request)
+	if deleteReq.recorder.Code != http.StatusNotImplemented || !strings.Contains(deleteReq.recorder.Body.String(), "<Code>NotImplemented</Code>") {
+		t.Fatalf("delete status = %d body = %s", deleteReq.recorder.Code, deleteReq.recorder.Body.String())
+	}
+	if bucket, err := meta.GetBucket(ctx, "photos"); err != nil || !bucket.Enabled {
+		t.Fatalf("photos bucket = %+v err = %v", bucket, err)
+	}
+}
+
+func newBucketDeleteTestServer(t *testing.T) (*metadata.SQLiteStore, http.Handler) {
+	t.Helper()
+	ctx := context.Background()
+	meta, err := metadata.OpenSQLite(filepath.Join(t.TempDir(), "metadata.sqlite"))
+	if err != nil {
+		t.Fatalf("OpenSQLite returned error: %v", err)
+	}
+	t.Cleanup(func() { _ = meta.Close() })
+	if err := meta.UpsertBucket(ctx, metadata.Bucket{Name: "photos", ChatID: "-100", CreatedAt: time.Now().UTC(), Enabled: true}); err != nil {
+		t.Fatalf("UpsertBucket photos returned error: %v", err)
+	}
+	if err := meta.UpsertBucket(ctx, metadata.Bucket{Name: "archive", ChatID: "-200", CreatedAt: time.Now().UTC(), Enabled: false}); err != nil {
+		t.Fatalf("UpsertBucket archive returned error: %v", err)
+	}
+	objectStore, err := store.NewObjectStore(meta, testutil.NewFakeTelegram(), store.Options{Upload: store.DefaultUploadConfig()})
+	if err != nil {
+		t.Fatalf("NewObjectStore returned error: %v", err)
+	}
+	server := NewServer(objectStore, Options{Region: "us-east-1", Credentials: map[string]string{"AKID": "SECRET"}, SigV4Clock: func() time.Time { return time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC) }, Ready: func() bool { return true }})
+	return meta, server
 }
 
 func TestHeadObjectResponsesAreBodyFree(t *testing.T) {
@@ -407,6 +467,10 @@ func (s errorPutObjectStore) ListBuckets(context.Context) ([]metadata.Bucket, er
 }
 
 func (s errorPutObjectStore) HeadBucket(context.Context, string) error {
+	return nil
+}
+
+func (s errorPutObjectStore) DeleteBucket(context.Context, string) error {
 	return nil
 }
 

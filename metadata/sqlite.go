@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -28,7 +29,11 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 }
 
 func OpenSQLiteReadOnly(path string) (*SQLiteStore, error) {
-	return openSQLite(sqliteReadOnlyDSN(path))
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	return openSQLite(sqliteReadOnlyDSN(absolutePath))
 }
 
 func openSQLite(dataSourceName string) (*SQLiteStore, error) {
@@ -266,6 +271,210 @@ func (s *SQLiteStore) DeleteObject(ctx context.Context, bucket, key string) erro
 	return tx.Commit()
 }
 
+func (s *SQLiteStore) CopyObject(ctx context.Context, bucket, srcKey, dstKey string, options CopyOptions) (CopyResult, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return CopyResult{}, err
+	}
+	defer tx.Rollback()
+
+	src, chunks, err := getObjectInTx(ctx, tx, bucket, srcKey)
+	if err != nil {
+		return CopyResult{}, err
+	}
+
+	dstExists, err := objectExistsInTx(ctx, tx, bucket, dstKey)
+	if err != nil {
+		return CopyResult{}, err
+	}
+	if dstExists && !options.Overwrite {
+		return CopyResult{}, errors.New("destination already exists")
+	}
+
+	if err := putObjectInTx(ctx, tx, Object{
+		Bucket:         bucket,
+		Key:            dstKey,
+		Size:           src.Size,
+		ContentType:    src.ContentType,
+		ETag:           src.ETag,
+		SHA256:         src.SHA256,
+		LastModified:   time.Now().UTC(),
+		ChunkCount:     src.ChunkCount,
+		TelegramType:   src.TelegramType,
+		UploadStrategy: src.UploadStrategy,
+	}, copyChunksForKey(chunks, bucket, dstKey)); err != nil {
+		return CopyResult{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return CopyResult{}, err
+	}
+	return CopyResult{Created: !dstExists}, nil
+}
+
+func (s *SQLiteStore) MoveObject(ctx context.Context, bucket, srcKey, dstKey string, options MoveOptions) (MoveResult, error) {
+	if srcKey == dstKey {
+		return MoveResult{}, errors.New("source and destination are the same")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return MoveResult{}, err
+	}
+	defer tx.Rollback()
+
+	src, chunks, err := getObjectInTx(ctx, tx, bucket, srcKey)
+	if err != nil {
+		return MoveResult{}, err
+	}
+
+	dstExists, err := objectExistsInTx(ctx, tx, bucket, dstKey)
+	if err != nil {
+		return MoveResult{}, err
+	}
+	if dstExists && !options.Overwrite {
+		return MoveResult{}, errors.New("destination already exists")
+	}
+
+	if err := putObjectInTx(ctx, tx, Object{
+		Bucket:         bucket,
+		Key:            dstKey,
+		Size:           src.Size,
+		ContentType:    src.ContentType,
+		ETag:           src.ETag,
+		SHA256:         src.SHA256,
+		LastModified:   time.Now().UTC(),
+		ChunkCount:     src.ChunkCount,
+		TelegramType:   src.TelegramType,
+		UploadStrategy: src.UploadStrategy,
+	}, copyChunksForKey(chunks, bucket, dstKey)); err != nil {
+		return MoveResult{}, err
+	}
+
+	if err := deleteObjectInTx(ctx, tx, bucket, srcKey); err != nil {
+		return MoveResult{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return MoveResult{}, err
+	}
+	return MoveResult{Created: !dstExists}, nil
+}
+
+func (s *SQLiteStore) CopyPrefix(ctx context.Context, bucket, srcPrefix, dstPrefix string, options CopyOptions) (CopyResult, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return CopyResult{}, err
+	}
+	defer tx.Rollback()
+
+	created, err := copyPrefixInTx(ctx, tx, bucket, srcPrefix, dstPrefix, options.Overwrite)
+	if err != nil {
+		return CopyResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return CopyResult{}, err
+	}
+	return CopyResult{Created: created}, nil
+}
+
+func (s *SQLiteStore) MovePrefix(ctx context.Context, bucket, srcPrefix, dstPrefix string, options MoveOptions) (MoveResult, error) {
+	if srcPrefix == dstPrefix {
+		return MoveResult{}, errors.New("source and destination are the same")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return MoveResult{}, err
+	}
+	defer tx.Rollback()
+
+	created, err := copyPrefixInTx(ctx, tx, bucket, srcPrefix, dstPrefix, options.Overwrite)
+	if err != nil {
+		return MoveResult{}, err
+	}
+	if err := deletePrefixInTx(ctx, tx, bucket, srcPrefix); err != nil {
+		return MoveResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return MoveResult{}, err
+	}
+	return MoveResult{Created: created}, nil
+}
+
+func (s *SQLiteStore) DeletePrefix(ctx context.Context, bucket, prefix string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := deletePrefixInTx(ctx, tx, bucket, prefix); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *SQLiteStore) DeleteBucket(ctx context.Context, bucket string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM object_chunks WHERE bucket = ?`, bucket); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM objects WHERE bucket = ?`, bucket); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM buckets WHERE name = ?`, bucket); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *SQLiteStore) ListAllObjects(ctx context.Context, bucket, prefix string) ([]Object, error) {
+	var all []Object
+	afterKey := ""
+	for {
+		objects, err := s.ListObjects(ctx, ListQuery{Bucket: bucket, Prefix: prefix, AfterKey: afterKey, Limit: 1000})
+		if err != nil {
+			return nil, err
+		}
+		if len(objects) == 0 {
+			return all, nil
+		}
+		all = append(all, objects...)
+		afterKey = objects[len(objects)-1].Key
+	}
+}
+
+func (s *SQLiteStore) CountObjects(ctx context.Context, bucket, prefix string) (int, error) {
+	row := s.db.QueryRowContext(ctx, `
+	SELECT COUNT(*)
+	FROM objects
+	WHERE bucket = ?
+	  AND key LIKE ? ESCAPE '\'
+	`, bucket, escapeSQLiteLikePattern(prefix)+"%")
+	var count int
+	if err := row.Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+func (s *SQLiteStore) DisableBucketsExcept(ctx context.Context, keepNames []string) error {
+	if len(keepNames) == 0 {
+		_, err := s.db.ExecContext(ctx, `UPDATE buckets SET enabled = 0 WHERE enabled = 1`)
+		return err
+	}
+	query := `UPDATE buckets SET enabled = 0 WHERE enabled = 1 AND name NOT IN (?` + strings.Repeat(",?", len(keepNames)-1) + `)`
+	args := make([]any, len(keepNames))
+	for i, name := range keepNames {
+		args[i] = name
+	}
+	_, err := s.db.ExecContext(ctx, query, args...)
+	return err
+}
+
 func (s *SQLiteStore) migrate() error {
 	_, err := s.db.Exec(`
 	CREATE TABLE IF NOT EXISTS buckets (
@@ -308,6 +517,190 @@ func (s *SQLiteStore) migrate() error {
 
 type objectScanner interface {
 	Scan(dest ...any) error
+}
+
+func getObjectInTx(ctx context.Context, tx *sql.Tx, bucket, key string) (Object, []Chunk, error) {
+	object, err := scanObject(tx.QueryRowContext(ctx, `
+	SELECT bucket, key, size, content_type, etag, sha256, last_modified, chunk_count, telegram_type, upload_strategy
+	FROM objects
+	WHERE bucket = ? AND key = ?
+	`, bucket, key))
+	if err != nil {
+		return Object{}, nil, err
+	}
+	chunks, err := listChunksInTx(ctx, tx, bucket, key)
+	if err != nil {
+		return Object{}, nil, err
+	}
+	return object, chunks, nil
+}
+
+func listChunksInTx(ctx context.Context, tx *sql.Tx, bucket, key string) ([]Chunk, error) {
+	rows, err := tx.QueryContext(ctx, `
+	SELECT bucket, key, part_number, offset, size, telegram_type, telegram_file_id, telegram_message_id, telegram_file_unique_id, sha256
+	FROM object_chunks
+	WHERE bucket = ? AND key = ?
+	ORDER BY part_number ASC
+	`, bucket, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var chunks []Chunk
+	for rows.Next() {
+		chunk, err := scanChunk(rows)
+		if err != nil {
+			return nil, err
+		}
+		chunks = append(chunks, chunk)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return chunks, nil
+}
+
+func scanChunk(scanner objectScanner) (Chunk, error) {
+	var chunk Chunk
+	if err := scanner.Scan(&chunk.Bucket, &chunk.Key, &chunk.PartNumber, &chunk.Offset, &chunk.Size, &chunk.TelegramType, &chunk.TelegramFileID, &chunk.TelegramMessageID, &chunk.TelegramFileUniqueID, &chunk.SHA256); err != nil {
+		return Chunk{}, err
+	}
+	return chunk, nil
+}
+
+func objectExistsInTx(ctx context.Context, tx *sql.Tx, bucket, key string) (bool, error) {
+	row := tx.QueryRowContext(ctx, `SELECT 1 FROM objects WHERE bucket = ? AND key = ?`, bucket, key)
+	var value int
+	if err := row.Scan(&value); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func putObjectInTx(ctx context.Context, tx *sql.Tx, object Object, chunks []Chunk) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM object_chunks WHERE bucket = ? AND key = ?`, object.Bucket, object.Key); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+	INSERT INTO objects (bucket, key, size, content_type, etag, sha256, last_modified, chunk_count, telegram_type, upload_strategy)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(bucket, key) DO UPDATE SET
+		size = excluded.size,
+		content_type = excluded.content_type,
+		etag = excluded.etag,
+		sha256 = excluded.sha256,
+		last_modified = excluded.last_modified,
+		chunk_count = excluded.chunk_count,
+		telegram_type = excluded.telegram_type,
+		upload_strategy = excluded.upload_strategy
+	`, object.Bucket, object.Key, object.Size, object.ContentType, object.ETag, object.SHA256, object.LastModified.Unix(), object.ChunkCount, object.TelegramType, object.UploadStrategy); err != nil {
+		return err
+	}
+	for _, chunk := range chunks {
+		if _, err := tx.ExecContext(ctx, `
+		INSERT INTO object_chunks (bucket, key, part_number, offset, size, telegram_type, telegram_file_id, telegram_message_id, telegram_file_unique_id, sha256)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, chunk.Bucket, chunk.Key, chunk.PartNumber, chunk.Offset, chunk.Size, chunk.TelegramType, chunk.TelegramFileID, chunk.TelegramMessageID, chunk.TelegramFileUniqueID, chunk.SHA256); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copyChunksForKey(chunks []Chunk, bucket, key string) []Chunk {
+	copied := make([]Chunk, len(chunks))
+	for i, chunk := range chunks {
+		chunk.Bucket = bucket
+		chunk.Key = key
+		copied[i] = chunk
+	}
+	return copied
+}
+
+func deleteObjectInTx(ctx context.Context, tx *sql.Tx, bucket, key string) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM object_chunks WHERE bucket = ? AND key = ?`, bucket, key); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM objects WHERE bucket = ? AND key = ?`, bucket, key); err != nil {
+		return err
+	}
+	return nil
+}
+
+func copyPrefixInTx(ctx context.Context, tx *sql.Tx, bucket, srcPrefix, dstPrefix string, overwrite bool) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `
+	SELECT bucket, key, size, content_type, etag, sha256, last_modified, chunk_count, telegram_type, upload_strategy
+	FROM objects
+	WHERE bucket = ?
+	  AND key LIKE ? ESCAPE '\'
+	ORDER BY key ASC
+	`, bucket, escapeSQLiteLikePattern(srcPrefix)+"%")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	var objects []Object
+	for rows.Next() {
+		object, err := scanObject(rows)
+		if err != nil {
+			return false, err
+		}
+		objects = append(objects, object)
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+
+	created := true
+	now := time.Now().UTC()
+	for _, src := range objects {
+		dstKey := dstPrefix + strings.TrimPrefix(src.Key, srcPrefix)
+		dstExists, err := objectExistsInTx(ctx, tx, bucket, dstKey)
+		if err != nil {
+			return false, err
+		}
+		if dstExists {
+			created = false
+			if !overwrite {
+				return false, errors.New("destination already exists")
+			}
+		}
+		chunks, err := listChunksInTx(ctx, tx, bucket, src.Key)
+		if err != nil {
+			return false, err
+		}
+		if err := putObjectInTx(ctx, tx, Object{
+			Bucket:         bucket,
+			Key:            dstKey,
+			Size:           src.Size,
+			ContentType:    src.ContentType,
+			ETag:           src.ETag,
+			SHA256:         src.SHA256,
+			LastModified:   now,
+			ChunkCount:     src.ChunkCount,
+			TelegramType:   src.TelegramType,
+			UploadStrategy: src.UploadStrategy,
+		}, copyChunksForKey(chunks, bucket, dstKey)); err != nil {
+			return false, err
+		}
+	}
+	return created, nil
+}
+
+func deletePrefixInTx(ctx context.Context, tx *sql.Tx, bucket, prefix string) error {
+	likePattern := escapeSQLiteLikePattern(prefix) + "%"
+	if _, err := tx.ExecContext(ctx, `DELETE FROM object_chunks WHERE bucket = ? AND key LIKE ? ESCAPE '\'`, bucket, likePattern); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM objects WHERE bucket = ? AND key LIKE ? ESCAPE '\'`, bucket, likePattern); err != nil {
+		return err
+	}
+	return nil
 }
 
 func scanObject(scanner objectScanner) (Object, error) {

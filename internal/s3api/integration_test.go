@@ -14,9 +14,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
-	"github.com/aahl/tgs3/internal/testutil"
-	"github.com/aahl/tgs3/metadata"
-	"github.com/aahl/tgs3/store"
+	"github.com/aahl/tgnas/internal/testutil"
+	"github.com/aahl/tgnas/metadata"
+	"github.com/aahl/tgnas/store"
 )
 
 func newAWSSDKTestClient(t *testing.T) (*s3.Client, *testutil.FakeTelegram) {
@@ -144,8 +144,8 @@ func TestMinIOSmokeCheckSkippedWhenUnavailable(t *testing.T) {
 	if mcErr != nil && rcloneErr != nil {
 		t.Skip("skipping S3 client smoke check: neither mc nor rclone is installed; AWS SDK integration tests remain the automated compatibility gate")
 	}
-	if _, err := os.Stat(filepath.Join("..", "..", "cmd", "tgs3")); err != nil {
-		t.Skipf("skipping S3 client smoke check: no cmd/tgs3 service entrypoint or fake/local Telegram endpoint is available yet: %v", err)
+	if _, err := os.Stat(filepath.Join("..", "..", "cmd", "tgnas")); err != nil {
+		t.Skipf("skipping S3 client smoke check: no cmd/tgnas service entrypoint or fake/local Telegram endpoint is available yet: %v", err)
 	}
 	t.Skip("skipping S3 client smoke check: local fake Telegram smoke harness is not available in this test package")
 }

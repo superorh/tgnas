@@ -48,6 +48,22 @@ type ListQuery struct {
 	Limit    int
 }
 
+type CopyOptions struct {
+	Overwrite bool
+}
+
+type MoveOptions struct {
+	Overwrite bool
+}
+
+type CopyResult struct {
+	Created bool
+}
+
+type MoveResult struct {
+	Created bool
+}
+
 type Store interface {
 	Close() error
 	UpsertBucket(ctx context.Context, bucket Bucket) error
@@ -58,4 +74,13 @@ type Store interface {
 	HeadObject(ctx context.Context, bucket, key string) (Object, error)
 	ListObjects(ctx context.Context, query ListQuery) ([]Object, error)
 	DeleteObject(ctx context.Context, bucket, key string) error
+	CopyObject(ctx context.Context, bucket, srcKey, dstKey string, options CopyOptions) (CopyResult, error)
+	MoveObject(ctx context.Context, bucket, srcKey, dstKey string, options MoveOptions) (MoveResult, error)
+	CopyPrefix(ctx context.Context, bucket, srcPrefix, dstPrefix string, options CopyOptions) (CopyResult, error)
+	MovePrefix(ctx context.Context, bucket, srcPrefix, dstPrefix string, options MoveOptions) (MoveResult, error)
+	DeletePrefix(ctx context.Context, bucket, prefix string) error
+	DeleteBucket(ctx context.Context, bucket string) error
+	ListAllObjects(ctx context.Context, bucket, prefix string) ([]Object, error)
+	CountObjects(ctx context.Context, bucket, prefix string) (int, error)
+	DisableBucketsExcept(ctx context.Context, keepNames []string) error
 }

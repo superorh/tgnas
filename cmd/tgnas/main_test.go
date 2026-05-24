@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,14 +14,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aahl/tgs3/metadata"
-	"github.com/aahl/tgs3/store"
-	"github.com/aahl/tgs3/telegram"
+	"github.com/aahl/tgnas/metadata"
+	"github.com/aahl/tgnas/store"
+	"github.com/aahl/tgnas/telegram"
 )
 
 func TestRunReturnsObjectStoreCreationFailure(t *testing.T) {
-	t.Setenv("TELEGRAM_BOT_TOKEN", "123456:valid-token")
-	t.Setenv("TGS3_SECRET_KEY", "secret")
+	t.Setenv("TGNAS_TELEGRAM_BOT_TOKEN", "123456:valid-token")
+	t.Setenv("TGNAS_SECRET_KEY", "secret")
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	writeConfig(t, configPath, filepath.Join(t.TempDir(), "metadata.sqlite"))
 
@@ -111,23 +112,137 @@ func TestParseGlobalFlagsAcceptsDebugFlag(t *testing.T) {
 }
 
 func TestRunMainStartsServerWithoutSubcommand(t *testing.T) {
-	t.Setenv("TELEGRAM_BOT_TOKEN", "123456:valid-token")
-	t.Setenv("TGS3_SECRET_KEY", "secret")
+	t.Setenv("TGNAS_TELEGRAM_BOT_TOKEN", "123456:valid-token")
+	t.Setenv("TGNAS_SECRET_KEY", "secret")
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	writeConfig(t, configPath, filepath.Join(t.TempDir(), "metadata.sqlite"))
 
-	oldListenAndServe := listenAndServe
-	listenAndServe = func(addr string, handler http.Handler) error {
-		if addr != "127.0.0.1:0" {
-			t.Fatalf("addr = %q, want 127.0.0.1:0", addr)
+	oldRunServiceFunc := runServiceFunc
+	runServiceFunc = func(configPath string, mode serverMode, dbg debugLogger) error {
+		if mode != serverModeAll {
+			t.Fatalf("mode = %q, want %q", mode, serverModeAll)
 		}
 		return errors.New("server stopped")
 	}
-	t.Cleanup(func() { listenAndServe = oldListenAndServe })
+	t.Cleanup(func() { runServiceFunc = oldRunServiceFunc })
 
 	err := runMain([]string{"-c", configPath}, io.Discard, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "server stopped") {
 		t.Fatalf("err = %v, want server stopped", err)
+	}
+}
+
+func TestRunMainS3Subcommand(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	writeConfig(t, configPath, filepath.Join(t.TempDir(), "metadata.sqlite"))
+
+	called := false
+	oldRunServiceFunc := runServiceFunc
+	runServiceFunc = func(configPath string, mode serverMode, dbg debugLogger) error {
+		called = true
+		if mode != serverModeS3 {
+			t.Fatalf("mode = %q, want %q", mode, serverModeS3)
+		}
+		return nil
+	}
+	t.Cleanup(func() { runServiceFunc = oldRunServiceFunc })
+
+	if err := runMain([]string{"-c", configPath, "s3"}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("runMain returned error: %v", err)
+	}
+	if !called {
+		t.Fatal("runServiceFunc was not called")
+	}
+}
+
+func TestRunMainDAVSubcommand(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	writeConfig(t, configPath, filepath.Join(t.TempDir(), "metadata.sqlite"))
+
+	called := false
+	oldRunServiceFunc := runServiceFunc
+	runServiceFunc = func(configPath string, mode serverMode, dbg debugLogger) error {
+		called = true
+		if mode != serverModeDAV {
+			t.Fatalf("mode = %q, want %q", mode, serverModeDAV)
+		}
+		return nil
+	}
+	t.Cleanup(func() { runServiceFunc = oldRunServiceFunc })
+
+	if err := runMain([]string{"-c", configPath, "dav"}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("runMain returned error: %v", err)
+	}
+	if !called {
+		t.Fatal("runServiceFunc was not called")
+	}
+}
+
+func TestRunServiceWithDebugRoutesByMode(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		mode          serverMode
+		davStatus     int
+		bareDAVStatus int
+		s3Status      int
+		healthCode    int
+	}{
+		{name: "all", mode: serverModeAll, davStatus: http.StatusUnauthorized, bareDAVStatus: http.StatusPermanentRedirect, s3Status: http.StatusForbidden, healthCode: http.StatusOK},
+		{name: "s3", mode: serverModeS3, davStatus: http.StatusForbidden, bareDAVStatus: http.StatusForbidden, s3Status: http.StatusForbidden, healthCode: http.StatusOK},
+		{name: "dav", mode: serverModeDAV, davStatus: http.StatusUnauthorized, bareDAVStatus: http.StatusPermanentRedirect, s3Status: http.StatusNotFound, healthCode: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TGNAS_TELEGRAM_BOT_TOKEN", "123456:valid-token")
+			t.Setenv("TGNAS_SECRET_KEY", "secret")
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			writeConfig(t, configPath, filepath.Join(t.TempDir(), "metadata.sqlite"))
+
+			var handler http.Handler
+			oldListenAndServe := listenAndServe
+			listenAndServe = func(_ string, h http.Handler) error {
+				handler = h
+				return nil
+			}
+			t.Cleanup(func() { listenAndServe = oldListenAndServe })
+
+			if err := runServiceWithDebug(configPath, tc.mode, newDebugLogger(false, io.Discard)); err != nil {
+				t.Fatalf("runServiceWithDebug returned error: %v", err)
+			}
+			if handler == nil {
+				t.Fatal("listenAndServe did not receive a handler")
+			}
+
+			davReq := httptest.NewRequest(http.MethodOptions, "/dav/", nil)
+			davRec := httptest.NewRecorder()
+			handler.ServeHTTP(davRec, davReq)
+			if davRec.Code != tc.davStatus {
+				t.Fatalf("dav status = %d, want %d", davRec.Code, tc.davStatus)
+			}
+
+			bareDAVReq := httptest.NewRequest(http.MethodGet, "/dav", nil)
+			bareDAVRec := httptest.NewRecorder()
+			handler.ServeHTTP(bareDAVRec, bareDAVReq)
+			if bareDAVRec.Code != tc.bareDAVStatus {
+				t.Fatalf("bare dav status = %d, want %d", bareDAVRec.Code, tc.bareDAVStatus)
+			}
+			if tc.bareDAVStatus == http.StatusPermanentRedirect && bareDAVRec.Header().Get("Location") != "/dav/" {
+				t.Fatalf("bare dav Location = %q, want /dav/", bareDAVRec.Header().Get("Location"))
+			}
+
+			s3Req := httptest.NewRequest(http.MethodGet, "/photos", nil)
+			s3Rec := httptest.NewRecorder()
+			handler.ServeHTTP(s3Rec, s3Req)
+			if s3Rec.Code != tc.s3Status {
+				t.Fatalf("s3 status = %d, want %d", s3Rec.Code, tc.s3Status)
+			}
+
+			healthReq := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+			healthRec := httptest.NewRecorder()
+			handler.ServeHTTP(healthRec, healthReq)
+			if healthRec.Code != tc.healthCode {
+				t.Fatalf("health status = %d, want %d", healthRec.Code, tc.healthCode)
+			}
+		})
 	}
 }
 
@@ -146,8 +261,8 @@ func TestRunMainRejectsDebugFlagAfterSubcommand(t *testing.T) {
 }
 
 func TestRunMainDebugLogsServiceModeToStderr(t *testing.T) {
-	t.Setenv("TELEGRAM_BOT_TOKEN", "123456:valid-token")
-	t.Setenv("TGS3_SECRET_KEY", "secret")
+	t.Setenv("TGNAS_TELEGRAM_BOT_TOKEN", "123456:valid-token")
+	t.Setenv("TGNAS_SECRET_KEY", "secret")
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	sqlitePath := filepath.Join(t.TempDir(), "metadata.sqlite")
 	writeConfig(t, configPath, sqlitePath)
@@ -161,7 +276,7 @@ func TestRunMainDebugLogsServiceModeToStderr(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runMain returned error: %v", err)
 	}
-	for _, want := range []string{"debug mode=service", "config_path=" + strconv.Quote(configPath), "sqlite_path=" + strconv.Quote(sqlitePath), "listen_addr=" + strconv.Quote("127.0.0.1:0"), "bucket=" + strconv.Quote("photos")} {
+	for _, want := range []string{"debug mode=all", "config_path=" + strconv.Quote(configPath), "sqlite_path=" + strconv.Quote(sqlitePath), "listen_addr=" + strconv.Quote("127.0.0.1:0"), "bucket=" + strconv.Quote("photos")} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("stderr = %q, want substring %q", stderr.String(), want)
 		}
@@ -280,7 +395,7 @@ func TestRunMainGlobalHelpSucceedsAndWritesUsage(t *testing.T) {
 		t.Fatalf("runMain returned error: %v", err)
 	}
 	got := errOut.String()
-	want := "Usage:\n  tgs3 [-debug] [-c|-config config.yaml]\n  tgs3 [-debug] [-c|-config config.yaml] ls [-n|-limit N] bucket[/prefix]\n  tgs3 [-debug] [-c|-config config.yaml] lsd [bucket[/prefix]]\n"
+	want := "Usage:\n  tgnas [-debug] [-c|-config config.yaml]\n  tgnas [-debug] [-c|-config config.yaml] s3\n  tgnas [-debug] [-c|-config config.yaml] dav\n  tgnas [-debug] [-c|-config config.yaml] ls [-n|-limit N] bucket[/prefix]\n  tgnas [-debug] [-c|-config config.yaml] lsd [bucket[/prefix]]\n"
 	if got != want {
 		t.Fatalf("help output = %q, want %q", got, want)
 	}
@@ -668,6 +783,101 @@ func TestRunLSDDeduplicatesCommonPrefixesAcrossPageBoundary(t *testing.T) {
 	}
 }
 
+func TestRunServiceWithDebugDisablesOrphanBuckets(t *testing.T) {
+	t.Setenv("TGNAS_TELEGRAM_BOT_TOKEN", "123456:valid-token")
+	t.Setenv("TGNAS_SECRET_KEY", "secret")
+	sqlitePath := filepath.Join(t.TempDir(), "metadata.sqlite")
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	writeConfig(t, configPath, sqlitePath)
+
+	meta, err := metadata.OpenSQLite(sqlitePath)
+	if err != nil {
+		t.Fatalf("OpenSQLite returned error: %v", err)
+	}
+	ctx := context.Background()
+	if err := meta.UpsertBucket(ctx, metadata.Bucket{Name: "photos", ChatID: "-100", CreatedAt: time.Now().UTC(), Enabled: true}); err != nil {
+		t.Fatalf("UpsertBucket photos returned error: %v", err)
+	}
+	if err := meta.UpsertBucket(ctx, metadata.Bucket{Name: "archive", ChatID: "-200", CreatedAt: time.Now().UTC(), Enabled: true}); err != nil {
+		t.Fatalf("UpsertBucket archive returned error: %v", err)
+	}
+	if err := meta.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	oldListenAndServe := listenAndServe
+	listenAndServe = func(string, http.Handler) error { return nil }
+	t.Cleanup(func() { listenAndServe = oldListenAndServe })
+
+	if err := runServiceWithDebug(configPath, serverModeAll, newDebugLogger(false, io.Discard)); err != nil {
+		t.Fatalf("runServiceWithDebug returned error: %v", err)
+	}
+
+	meta, err = metadata.OpenSQLite(sqlitePath)
+	if err != nil {
+		t.Fatalf("OpenSQLite returned error: %v", err)
+	}
+	defer meta.Close()
+
+	photos, err := meta.GetBucket(ctx, "photos")
+	if err != nil {
+		t.Fatalf("GetBucket photos returned error: %v", err)
+	}
+	if !photos.Enabled {
+		t.Fatal("photos should remain enabled")
+	}
+	archive, err := meta.GetBucket(ctx, "archive")
+	if err != nil {
+		t.Fatalf("GetBucket archive returned error: %v", err)
+	}
+	if archive.Enabled {
+		t.Fatal("archive should be disabled (orphan bucket)")
+	}
+}
+
+func TestModuleAndImportsUseTgnasPath(t *testing.T) {
+	repoRoot := filepath.Join("..", "..")
+	oldPath := "github.com/aahl/" + "tgs3"
+	newPath := "github.com/aahl/tgnas"
+
+	goMod, err := os.ReadFile(filepath.Join(repoRoot, "go.mod"))
+	if err != nil {
+		t.Fatalf("ReadFile go.mod returned error: %v", err)
+	}
+	if !strings.Contains(string(goMod), "module "+newPath) {
+		t.Fatalf("go.mod module path does not contain %q", newPath)
+	}
+	if strings.Contains(string(goMod), oldPath) {
+		t.Fatalf("go.mod still contains old path %q", oldPath)
+	}
+
+	if err := filepath.WalkDir(repoRoot, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			switch entry.Name() {
+			case ".git", ".claude", "tgnas":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(path) != ".go" {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if strings.Contains(string(data), oldPath) {
+			t.Fatalf("%s still contains old path %q", path, oldPath)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WalkDir returned error: %v", err)
+	}
+}
+
 func writeConfig(t *testing.T, path, sqlitePath string) {
 	t.Helper()
 	config := `server:
@@ -676,9 +886,9 @@ auth:
   region: "us-east-1"
   credentials:
     - access_key: "admin"
-      secret_key_env: "TGS3_SECRET_KEY"
+      secret_key_env: "TGNAS_SECRET_KEY"
 telegram:
-  bot_token_env: "TELEGRAM_BOT_TOKEN"
+  bot_token_env: "TGNAS_TELEGRAM_BOT_TOKEN"
 metadata:
   sqlite_path: "` + sqlitePath + `"
 buckets:

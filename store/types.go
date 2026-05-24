@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/aahl/tgs3/telegram"
+	"github.com/aahl/tgnas/telegram"
 )
 
 var (

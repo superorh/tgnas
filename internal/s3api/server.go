@@ -13,13 +13,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aahl/tgs3/metadata"
-	"github.com/aahl/tgs3/store"
+	"github.com/aahl/tgnas/metadata"
+	"github.com/aahl/tgnas/store"
 )
 
 type ObjectStore interface {
 	ListBuckets(ctx context.Context) ([]metadata.Bucket, error)
 	HeadBucket(ctx context.Context, name string) error
+	DeleteBucket(ctx context.Context, name string) error
 	PutObject(ctx context.Context, input store.PutObjectInput) (store.PutObjectResult, error)
 	GetObject(ctx context.Context, input store.GetObjectInput) (io.ReadCloser, store.ObjectInfo, error)
 	HeadObject(ctx context.Context, bucket, key string) (store.ObjectInfo, error)
@@ -207,6 +208,12 @@ func (s *Server) handleBucket(w http.ResponseWriter, r *http.Request, bucket str
 		w.WriteHeader(http.StatusOK)
 	case http.MethodGet:
 		s.listObjectsV2(w, r, bucket)
+	case http.MethodDelete:
+		if err := s.store.DeleteBucket(r.Context(), bucket); err != nil {
+			WriteErrorResponse(w, r, MapError(err), r.URL.Path, "")
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	default:
 		http.NotFound(w, r)
 	}

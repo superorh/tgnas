@@ -447,6 +447,39 @@ func TestSQLiteListBucketsSkipsDisabled(t *testing.T) {
 	}
 }
 
+func TestOpenSQLiteReadOnlyOpensExistingRelativeDatabase(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.Mkdir("data", 0o755); err != nil {
+		t.Fatalf("Mkdir returned error: %v", err)
+	}
+	path := filepath.Join("data", "metadata.sqlite")
+	writable, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatalf("OpenSQLite returned error: %v", err)
+	}
+	if err := writable.UpsertBucket(t.Context(), Bucket{Name: "photos", ChatID: "-100", CreatedAt: time.Unix(10, 0), Enabled: true}); err != nil {
+		t.Fatalf("UpsertBucket returned error: %v", err)
+	}
+	if err := writable.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	readonly, err := OpenSQLiteReadOnly(path)
+	if err != nil {
+		t.Fatalf("OpenSQLiteReadOnly returned error: %v", err)
+	}
+	defer readonly.Close()
+
+	buckets, err := readonly.ListBuckets(t.Context())
+	if err != nil {
+		t.Fatalf("ListBuckets returned error: %v", err)
+	}
+	if len(buckets) != 1 || buckets[0].Name != "photos" {
+		t.Fatalf("buckets = %+v", buckets)
+	}
+}
+
 func TestOpenSQLiteReadOnlyOpensExistingDatabaseWithoutWrites(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "metadata.sqlite")
 	writable, err := OpenSQLite(path)
@@ -487,6 +520,375 @@ func TestOpenSQLiteReadOnlyDoesNotCreateMissingDatabase(t *testing.T) {
 	}
 	if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("sqlite path was created or stat failed unexpectedly: %v", statErr)
+	}
+}
+
+func TestSQLiteCopyObjectCreatesNew(t *testing.T) {
+	store := openTestSQLiteStore(t)
+	defer store.Close()
+
+	src := newTestObject("photos", "src.txt", 10)
+	src.Size = 100
+	src.ETag = "etag1"
+	chunks := []Chunk{singleChunk("photos", "src.txt")}
+	if err := store.PutObject(t.Context(), src, chunks); err != nil {
+		t.Fatalf("PutObject source returned error: %v", err)
+	}
+
+	result, err := store.CopyObject(t.Context(), "photos", "src.txt", "dst.txt", CopyOptions{})
+	if err != nil {
+		t.Fatalf("CopyObject returned error: %v", err)
+	}
+	if !result.Created {
+		t.Fatal("Created = false, want true")
+	}
+
+	gotObject, gotChunks, err := store.GetObject(t.Context(), "photos", "dst.txt")
+	if err != nil {
+		t.Fatalf("GetObject destination returned error: %v", err)
+	}
+	if gotObject.Key != "dst.txt" || gotObject.Size != 100 || gotObject.ETag != "etag1" || gotObject.SHA256 != src.SHA256 {
+		t.Fatalf("destination object = %+v", gotObject)
+	}
+	if len(gotChunks) != 1 || gotChunks[0].Key != "dst.txt" || gotChunks[0].TelegramFileID != chunks[0].TelegramFileID {
+		t.Fatalf("destination chunks = %+v", gotChunks)
+	}
+}
+
+func TestSQLiteCopyObjectNoOverwriteFailsIfExists(t *testing.T) {
+	store := openTestSQLiteStore(t)
+	defer store.Close()
+
+	if err := store.PutObject(t.Context(), newTestObject("photos", "src.txt", 10), []Chunk{singleChunk("photos", "src.txt")}); err != nil {
+		t.Fatalf("PutObject source returned error: %v", err)
+	}
+	if err := store.PutObject(t.Context(), newTestObject("photos", "dst.txt", 20), []Chunk{singleChunk("photos", "dst.txt")}); err != nil {
+		t.Fatalf("PutObject destination returned error: %v", err)
+	}
+
+	_, err := store.CopyObject(t.Context(), "photos", "src.txt", "dst.txt", CopyOptions{Overwrite: false})
+	if err == nil {
+		t.Fatal("CopyObject returned nil error, want destination exists error")
+	}
+
+	gotObject, _, err := store.GetObject(t.Context(), "photos", "dst.txt")
+	if err != nil {
+		t.Fatalf("GetObject destination returned error: %v", err)
+	}
+	if gotObject.ETag != "dst.txt-etag" {
+		t.Fatalf("destination was modified: %+v", gotObject)
+	}
+}
+
+func TestSQLiteCopyObjectOverwriteReplacesDestination(t *testing.T) {
+	store := openTestSQLiteStore(t)
+	defer store.Close()
+
+	src := newTestObject("photos", "src.txt", 10)
+	src.Size = 100
+	src.ETag = "etag1"
+	if err := store.PutObject(t.Context(), src, []Chunk{singleChunk("photos", "src.txt")}); err != nil {
+		t.Fatalf("PutObject source returned error: %v", err)
+	}
+	if err := store.PutObject(t.Context(), newTestObject("photos", "dst.txt", 20), []Chunk{singleChunk("photos", "dst.txt")}); err != nil {
+		t.Fatalf("PutObject destination returned error: %v", err)
+	}
+
+	result, err := store.CopyObject(t.Context(), "photos", "src.txt", "dst.txt", CopyOptions{Overwrite: true})
+	if err != nil {
+		t.Fatalf("CopyObject returned error: %v", err)
+	}
+	if result.Created {
+		t.Fatal("Created = true, want false for overwrite")
+	}
+
+	gotObject, _, err := store.GetObject(t.Context(), "photos", "dst.txt")
+	if err != nil {
+		t.Fatalf("GetObject destination returned error: %v", err)
+	}
+	if gotObject.Size != 100 || gotObject.ETag != "etag1" {
+		t.Fatalf("destination object = %+v", gotObject)
+	}
+}
+
+func TestSQLiteMoveObjectSamePathPreservesSource(t *testing.T) {
+	store := openTestSQLiteStore(t)
+	defer store.Close()
+
+	src := newTestObject("photos", "same.txt", 10)
+	src.Size = 100
+	if err := store.PutObject(t.Context(), src, []Chunk{singleChunk("photos", "same.txt")}); err != nil {
+		t.Fatalf("PutObject source returned error: %v", err)
+	}
+
+	_, err := store.MoveObject(t.Context(), "photos", "same.txt", "same.txt", MoveOptions{Overwrite: true})
+	if err == nil {
+		t.Fatal("expected same-path move error")
+	}
+	if _, _, err := store.GetObject(t.Context(), "photos", "same.txt"); err != nil {
+		t.Fatalf("source missing after rejected same-path move: %v", err)
+	}
+}
+
+func TestSQLiteMoveObjectCreatesNewAndDeletesSource(t *testing.T) {
+	store := openTestSQLiteStore(t)
+	defer store.Close()
+
+	src := newTestObject("photos", "src.txt", 10)
+	src.Size = 100
+	src.ETag = "etag1"
+	if err := store.PutObject(t.Context(), src, []Chunk{singleChunk("photos", "src.txt")}); err != nil {
+		t.Fatalf("PutObject source returned error: %v", err)
+	}
+
+	result, err := store.MoveObject(t.Context(), "photos", "src.txt", "dst.txt", MoveOptions{})
+	if err != nil {
+		t.Fatalf("MoveObject returned error: %v", err)
+	}
+	if !result.Created {
+		t.Fatal("Created = false, want true")
+	}
+
+	_, err = store.HeadObject(t.Context(), "photos", "src.txt")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("HeadObject source error = %v, want ErrNotFound", err)
+	}
+	gotObject, gotChunks, err := store.GetObject(t.Context(), "photos", "dst.txt")
+	if err != nil {
+		t.Fatalf("GetObject destination returned error: %v", err)
+	}
+	if gotObject.Size != 100 || gotObject.ETag != "etag1" {
+		t.Fatalf("destination object = %+v", gotObject)
+	}
+	if len(gotChunks) != 1 || gotChunks[0].Key != "dst.txt" {
+		t.Fatalf("destination chunks = %+v", gotChunks)
+	}
+}
+
+func TestSQLiteCopyPrefixRecursive(t *testing.T) {
+	store := openTestSQLiteStore(t)
+	defer store.Close()
+
+	for _, object := range []Object{
+		newTestObject("photos", "dir/a.txt", 10),
+		newTestObject("photos", "dir/b.txt", 20),
+		newTestObject("photos", "dir/sub/c.txt", 30),
+		newTestObject("photos", "dir2/sibling.txt", 40),
+	} {
+		if err := store.PutObject(t.Context(), object, []Chunk{singleChunk(object.Bucket, object.Key)}); err != nil {
+			t.Fatalf("PutObject(%q) returned error: %v", object.Key, err)
+		}
+	}
+
+	_, err := store.CopyPrefix(t.Context(), "photos", "dir/", "copy/", CopyOptions{})
+	if err != nil {
+		t.Fatalf("CopyPrefix returned error: %v", err)
+	}
+
+	copied, err := store.ListAllObjects(t.Context(), "photos", "copy/")
+	if err != nil {
+		t.Fatalf("ListAllObjects copy returned error: %v", err)
+	}
+	assertObjectKeys(t, copied, []string{"copy/a.txt", "copy/b.txt", "copy/sub/c.txt"})
+	originals, err := store.ListAllObjects(t.Context(), "photos", "dir/")
+	if err != nil {
+		t.Fatalf("ListAllObjects original returned error: %v", err)
+	}
+	assertObjectKeys(t, originals, []string{"dir/a.txt", "dir/b.txt", "dir/sub/c.txt"})
+}
+
+func TestSQLiteMovePrefixSamePathPreservesSource(t *testing.T) {
+	store := openTestSQLiteStore(t)
+	defer store.Close()
+
+	for _, object := range []Object{
+		newTestObject("photos", "dir/a.txt", 10),
+		newTestObject("photos", "dir/b.txt", 20),
+	} {
+		if err := store.PutObject(t.Context(), object, []Chunk{singleChunk(object.Bucket, object.Key)}); err != nil {
+			t.Fatalf("PutObject(%q) returned error: %v", object.Key, err)
+		}
+	}
+
+	_, err := store.MovePrefix(t.Context(), "photos", "dir/", "dir/", MoveOptions{Overwrite: true})
+	if err == nil {
+		t.Fatal("expected same-prefix move error")
+	}
+	objects, err := store.ListAllObjects(t.Context(), "photos", "dir/")
+	if err != nil {
+		t.Fatalf("ListAllObjects returned error: %v", err)
+	}
+	assertObjectKeys(t, objects, []string{"dir/a.txt", "dir/b.txt"})
+}
+
+func TestSQLiteMovePrefixRecursive(t *testing.T) {
+	store := openTestSQLiteStore(t)
+	defer store.Close()
+
+	for _, object := range []Object{
+		newTestObject("photos", "dir/a.txt", 10),
+		newTestObject("photos", "dir/b.txt", 20),
+	} {
+		if err := store.PutObject(t.Context(), object, []Chunk{singleChunk(object.Bucket, object.Key)}); err != nil {
+			t.Fatalf("PutObject(%q) returned error: %v", object.Key, err)
+		}
+	}
+
+	_, err := store.MovePrefix(t.Context(), "photos", "dir/", "moved/", MoveOptions{})
+	if err != nil {
+		t.Fatalf("MovePrefix returned error: %v", err)
+	}
+
+	originals, err := store.ListAllObjects(t.Context(), "photos", "dir/")
+	if err != nil {
+		t.Fatalf("ListAllObjects original returned error: %v", err)
+	}
+	if len(originals) != 0 {
+		t.Fatalf("source objects = %+v, want none", originals)
+	}
+	moved, err := store.ListAllObjects(t.Context(), "photos", "moved/")
+	if err != nil {
+		t.Fatalf("ListAllObjects moved returned error: %v", err)
+	}
+	assertObjectKeys(t, moved, []string{"moved/a.txt", "moved/b.txt"})
+}
+
+func TestSQLiteDeletePrefixRecursive(t *testing.T) {
+	store := openTestSQLiteStore(t)
+	defer store.Close()
+
+	for _, object := range []Object{
+		newTestObject("photos", "dir/a.txt", 10),
+		newTestObject("photos", "dir/b.txt", 20),
+		newTestObject("photos", "other.txt", 30),
+	} {
+		if err := store.PutObject(t.Context(), object, []Chunk{singleChunk(object.Bucket, object.Key)}); err != nil {
+			t.Fatalf("PutObject(%q) returned error: %v", object.Key, err)
+		}
+	}
+
+	if err := store.DeletePrefix(t.Context(), "photos", "dir/"); err != nil {
+		t.Fatalf("DeletePrefix returned error: %v", err)
+	}
+
+	underDir, err := store.ListAllObjects(t.Context(), "photos", "dir/")
+	if err != nil {
+		t.Fatalf("ListAllObjects dir returned error: %v", err)
+	}
+	if len(underDir) != 0 {
+		t.Fatalf("dir objects = %+v, want none", underDir)
+	}
+	remaining, err := store.ListAllObjects(t.Context(), "photos", "")
+	if err != nil {
+		t.Fatalf("ListAllObjects all returned error: %v", err)
+	}
+	assertObjectKeys(t, remaining, []string{"other.txt"})
+}
+
+func TestSQLiteDeleteBucketRemovesBucketObjectsAndChunks(t *testing.T) {
+	store := openTestSQLiteStore(t)
+	defer store.Close()
+
+	if err := store.UpsertBucket(t.Context(), Bucket{Name: "photos", ChatID: "-100", CreatedAt: time.Unix(1, 0), Enabled: false}); err != nil {
+		t.Fatalf("UpsertBucket returned error: %v", err)
+	}
+	if err := store.PutObject(t.Context(), newTestObject("photos", "a.txt", 10), []Chunk{singleChunk("photos", "a.txt")}); err != nil {
+		t.Fatalf("PutObject returned error: %v", err)
+	}
+
+	if err := store.DeleteBucket(t.Context(), "photos"); err != nil {
+		t.Fatalf("DeleteBucket returned error: %v", err)
+	}
+
+	_, err := store.GetBucket(t.Context(), "photos")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetBucket error = %v, want ErrNotFound", err)
+	}
+	objects, err := store.ListAllObjects(t.Context(), "photos", "")
+	if err != nil {
+		t.Fatalf("ListAllObjects returned error: %v", err)
+	}
+	if len(objects) != 0 {
+		t.Fatalf("objects = %+v, want none", objects)
+	}
+}
+
+func TestSQLiteDisableBucketsExceptDisablesRemovedBuckets(t *testing.T) {
+	store := openTestSQLiteStore(t)
+	defer store.Close()
+
+	for _, b := range []Bucket{
+		{Name: "photos", ChatID: "-100", CreatedAt: time.Unix(1, 0), Enabled: true},
+		{Name: "archive", ChatID: "-200", CreatedAt: time.Unix(2, 0), Enabled: true},
+		{Name: "backups", ChatID: "-300", CreatedAt: time.Unix(3, 0), Enabled: true},
+	} {
+		if err := store.UpsertBucket(t.Context(), b); err != nil {
+			t.Fatalf("UpsertBucket(%s) returned error: %v", b.Name, err)
+		}
+	}
+
+	if err := store.DisableBucketsExcept(t.Context(), []string{"photos", "backups"}); err != nil {
+		t.Fatalf("DisableBucketsExcept returned error: %v", err)
+	}
+
+	photos, err := store.GetBucket(t.Context(), "photos")
+	if err != nil {
+		t.Fatalf("GetBucket photos returned error: %v", err)
+	}
+	if !photos.Enabled {
+		t.Fatal("photos should remain enabled")
+	}
+	backups, err := store.GetBucket(t.Context(), "backups")
+	if err != nil {
+		t.Fatalf("GetBucket backups returned error: %v", err)
+	}
+	if !backups.Enabled {
+		t.Fatal("backups should remain enabled")
+	}
+	archive, err := store.GetBucket(t.Context(), "archive")
+	if err != nil {
+		t.Fatalf("GetBucket archive returned error: %v", err)
+	}
+	if archive.Enabled {
+		t.Fatal("archive should be disabled")
+	}
+}
+
+func TestSQLiteDisableBucketsExceptEmptyKeepListDisablesAll(t *testing.T) {
+	store := openTestSQLiteStore(t)
+	defer store.Close()
+
+	if err := store.UpsertBucket(t.Context(), Bucket{Name: "photos", ChatID: "-100", CreatedAt: time.Unix(1, 0), Enabled: true}); err != nil {
+		t.Fatalf("UpsertBucket returned error: %v", err)
+	}
+	if err := store.DisableBucketsExcept(t.Context(), nil); err != nil {
+		t.Fatalf("DisableBucketsExcept returned error: %v", err)
+	}
+	bucket, err := store.GetBucket(t.Context(), "photos")
+	if err != nil {
+		t.Fatalf("GetBucket returned error: %v", err)
+	}
+	if bucket.Enabled {
+		t.Fatal("photos should be disabled when keep list is empty")
+	}
+}
+
+func TestSQLiteDisableBucketsExceptNoopWhenAllKept(t *testing.T) {
+	store := openTestSQLiteStore(t)
+	defer store.Close()
+
+	if err := store.UpsertBucket(t.Context(), Bucket{Name: "photos", ChatID: "-100", CreatedAt: time.Unix(1, 0), Enabled: true}); err != nil {
+		t.Fatalf("UpsertBucket returned error: %v", err)
+	}
+	if err := store.DisableBucketsExcept(t.Context(), []string{"photos"}); err != nil {
+		t.Fatalf("DisableBucketsExcept returned error: %v", err)
+	}
+	bucket, err := store.GetBucket(t.Context(), "photos")
+	if err != nil {
+		t.Fatalf("GetBucket returned error: %v", err)
+	}
+	if !bucket.Enabled {
+		t.Fatal("photos should remain enabled")
 	}
 }
 

@@ -33,6 +33,7 @@ type Config struct {
 	Metadata MetadataConfig          `yaml:"metadata"`
 	Storage  StorageConfig           `yaml:"storage"`
 	Buckets  map[string]BucketConfig `yaml:"buckets"`
+	WebDAV   WebDAVConfig            `yaml:"webdav"`
 }
 
 type ServerConfig struct {
@@ -81,9 +82,40 @@ type BucketConfig struct {
 	ChatID string `yaml:"chat_id"`
 }
 
+type WebDAVConfig struct {
+	Prefix string `yaml:"prefix"`
+}
+
+func (c *Config) applyWebDAVDefaults() {
+	if c.WebDAV.Prefix == "" {
+		c.WebDAV.Prefix = "/dav/"
+	}
+	if !strings.HasSuffix(c.WebDAV.Prefix, "/") {
+		c.WebDAV.Prefix += "/"
+	}
+}
+
+func (c Config) validateWebDAV() error {
+	prefix := c.WebDAV.Prefix
+	if prefix == "/" {
+		return fmt.Errorf("webdav prefix cannot be /")
+	}
+	if !strings.HasPrefix(prefix, "/") {
+		return fmt.Errorf("webdav prefix must start with /")
+	}
+	firstSegment := strings.TrimPrefix(prefix, "/")
+	if idx := strings.Index(firstSegment, "/"); idx >= 0 {
+		firstSegment = firstSegment[:idx]
+	}
+	if _, exists := c.Buckets[firstSegment]; exists {
+		return fmt.Errorf("webdav prefix first segment %q conflicts with bucket name", firstSegment)
+	}
+	return nil
+}
+
 func LoadFile(path string) (Config, error) {
 	cfg := Config{
-		Server: ServerConfig{Listen: ":9000", ListenEnv: "TGS3_LISTEN"},
+		Server: ServerConfig{Listen: ":9000", ListenEnv: "TGNAS_LISTEN"},
 		Auth:   AuthConfig{Region: "us-east-1"},
 		Telegram: TelegramConfig{
 			APIBaseURL: "https://api.telegram.org",
@@ -110,6 +142,7 @@ func LoadFile(path string) (Config, error) {
 	}
 
 	applyStorageDefaults(&cfg.Storage)
+	cfg.applyWebDAVDefaults()
 
 	for name, bucket := range cfg.Buckets {
 		chatID, err := resolveBucketChatID(bucket.ChatID)
@@ -240,6 +273,10 @@ func (c Config) Validate() error {
 		if strings.TrimSpace(bucket.ChatID) == "" {
 			return fmt.Errorf("bucket %q chat id is required", name)
 		}
+	}
+
+	if err := c.validateWebDAV(); err != nil {
+		return err
 	}
 
 	return nil

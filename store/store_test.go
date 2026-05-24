@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aahl/tgs3/internal/testutil"
-	"github.com/aahl/tgs3/metadata"
-	"github.com/aahl/tgs3/telegram"
+	"github.com/aahl/tgnas/internal/testutil"
+	"github.com/aahl/tgnas/metadata"
+	"github.com/aahl/tgnas/telegram"
 )
 
 func TestStoreHeadBucketUsesStartupConfiguredMetadata(t *testing.T) {
@@ -94,6 +94,41 @@ func TestStorePutHeadDeleteAndList(t *testing.T) {
 	_, err = objectStore.HeadObject(ctx, "photos", "hello.txt")
 	if err != ErrNoSuchKey {
 		t.Fatalf("err = %v, want ErrNoSuchKey", err)
+	}
+}
+
+func TestStorePutZeroByteObjectStoresMetadataWithoutTelegramUpload(t *testing.T) {
+	ctx := context.Background()
+	meta, err := metadata.OpenSQLite(filepath.Join(t.TempDir(), "metadata.sqlite"))
+	if err != nil {
+		t.Fatalf("OpenSQLite returned error: %v", err)
+	}
+	defer meta.Close()
+	if err := meta.UpsertBucket(ctx, metadata.Bucket{Name: "photos", ChatID: "-100", CreatedAt: time.Now().UTC(), Enabled: true}); err != nil {
+		t.Fatalf("UpsertBucket returned error: %v", err)
+	}
+	fake := testutil.NewFakeTelegram()
+	objectStore := mustNewObjectStore(t, meta, fake, Options{Upload: DefaultUploadConfig()})
+
+	result, err := objectStore.PutObject(ctx, PutObjectInput{Bucket: "photos", Key: "empty.txt", ContentType: "text/plain", Size: 0, Body: strings.NewReader("")})
+	if err != nil {
+		t.Fatalf("PutObject returned error: %v", err)
+	}
+	if result.ETag != "d41d8cd98f00b204e9800998ecf8427e" {
+		t.Fatalf("etag = %q", result.ETag)
+	}
+	if len(fake.Uploads) != 0 {
+		t.Fatalf("uploads = %+v, want none", fake.Uploads)
+	}
+	object, chunks, err := meta.GetObject(ctx, "photos", "empty.txt")
+	if err != nil {
+		t.Fatalf("GetObject returned error: %v", err)
+	}
+	if object.Size != 0 || object.ChunkCount != 0 || object.ContentType != "text/plain" {
+		t.Fatalf("object = %+v", object)
+	}
+	if len(chunks) != 0 {
+		t.Fatalf("chunks = %+v, want none", chunks)
 	}
 }
 
@@ -749,6 +784,42 @@ func (s listBucketsFailStore) DeleteObject(ctx context.Context, bucket, key stri
 
 func (s listBucketsFailStore) ListObjects(ctx context.Context, query metadata.ListQuery) ([]metadata.Object, error) {
 	return nil, errors.New("not implemented")
+}
+
+func (s listBucketsFailStore) CopyObject(ctx context.Context, bucket, srcKey, dstKey string, options metadata.CopyOptions) (metadata.CopyResult, error) {
+	return metadata.CopyResult{}, errors.New("not implemented")
+}
+
+func (s listBucketsFailStore) MoveObject(ctx context.Context, bucket, srcKey, dstKey string, options metadata.MoveOptions) (metadata.MoveResult, error) {
+	return metadata.MoveResult{}, errors.New("not implemented")
+}
+
+func (s listBucketsFailStore) CopyPrefix(ctx context.Context, bucket, srcPrefix, dstPrefix string, options metadata.CopyOptions) (metadata.CopyResult, error) {
+	return metadata.CopyResult{}, errors.New("not implemented")
+}
+
+func (s listBucketsFailStore) MovePrefix(ctx context.Context, bucket, srcPrefix, dstPrefix string, options metadata.MoveOptions) (metadata.MoveResult, error) {
+	return metadata.MoveResult{}, errors.New("not implemented")
+}
+
+func (s listBucketsFailStore) DeletePrefix(ctx context.Context, bucket, prefix string) error {
+	return errors.New("not implemented")
+}
+
+func (s listBucketsFailStore) DeleteBucket(ctx context.Context, bucket string) error {
+	return errors.New("not implemented")
+}
+
+func (s listBucketsFailStore) ListAllObjects(ctx context.Context, bucket, prefix string) ([]metadata.Object, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (s listBucketsFailStore) CountObjects(ctx context.Context, bucket, prefix string) (int, error) {
+	return 0, errors.New("not implemented")
+}
+
+func (s listBucketsFailStore) DisableBucketsExcept(ctx context.Context, keepNames []string) error {
+	return errors.New("not implemented")
 }
 
 func (s listBucketsFailStore) Close() error {

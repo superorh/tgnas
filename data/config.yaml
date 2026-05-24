@@ -1,7 +1,7 @@
 server:
   # listen: ":9000"
   # If set and the environment variable is non-empty, it overrides listen.
-  # listen_env: "TGS3_LISTEN"
+  # listen_env: "TGNAS_LISTEN"
   # Public URL used when the service needs to describe its external endpoint.
   # public_base_url: "https://s3.example.com"
 
@@ -9,10 +9,10 @@ auth:
   # region: "us-east-1"
   credentials:
     - access_key: "admin"
-      secret_key_env: "TGS3_SECRET_KEY"
+      secret_key_env: "TGNAS_SECRET_KEY"
 
 telegram:
-  bot_token_env: "TELEGRAM_BOT_TOKEN"
+  bot_token_env: "TGNAS_TELEGRAM_BOT_TOKEN"
   # api_base_url: "https://api.telegram.org"
   # caption_template: "{bucket}/{key}"
   # timeout: "30s"
@@ -20,7 +20,7 @@ telegram:
 metadata:
   # sqlite_path: "data/metadata.sqlite"
   # If set and the environment variable is non-empty, it overrides sqlite_path.
-  # sqlite_path_env: "TGS3_SQLITE_PATH"
+  # sqlite_path_env: "TGNAS_SQLITE_PATH"
 
 storage:
   # upload_type_strategy: "document"
@@ -38,8 +38,11 @@ storage:
   # max_concurrent_telegram_requests: 8
   # put_buffer_size: 1048576
 
+webdav:
+  # prefix: "/dav/"
+
 buckets:
   mybucket:
     chat_id: "-1001234567890"
   # private:
-  #   chat_id: "${TGS3_PRIVATE_CHAT_ID}"
+  #   chat_id: "${TGNAS_PRIVATE_CHAT_ID}"
