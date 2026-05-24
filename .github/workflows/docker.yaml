@@ -1,0 +1,39 @@
+name: Build Docker Image
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - .github/**
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Optional image tag override
+        required: false
+        default: ''
+
+jobs:
+  build:
+    uses: docker/github-builder/.github/workflows/build.yml@v1
+    permissions:
+      contents: read  # to fetch the repository content
+      id-token: write # for signing attestation(s) with GitHub OIDC Token
+    with:
+      output: image
+      push: ${{ github.event_name != 'pull_request' }}
+      meta-images: |
+        ghcr.io/${{ github.repository }}
+      meta-tags: |
+        type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+        type=ref,event=branch
+        type=ref,event=pr
+        type=semver,pattern={{version}}
+        type=semver,pattern={{major}}.{{minor}}
+      platforms: linux/amd64,linux/arm64
+    secrets:
+      registry-auths: |
+        - registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}

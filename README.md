@@ -1,4 +1,4 @@
-# tgnas
+# TgNAS
 
 `tgnas` is an S3-compatible and WebDAV-capable gateway backed by Telegram storage and local SQLite metadata.
 
@@ -25,13 +25,13 @@ tgnas -c config.yaml dav
 
 The default config path is `data/config.yaml`.
 
-Common environment variables use the `TGNAS_*` prefix:
+Common environment variables:
 
-- `TGNAS_LISTEN` overrides `server.listen` when `server.listen_env` is configured.
+- `TGNAS_LISTEN` overrides `server.listen` when `server.listen_env` is configured. Default is `:9000`.
 - `TGNAS_SECRET_KEY` is the example S3/WebDAV credential secret.
-- `TGNAS_TELEGRAM_BOT_TOKEN` provides the Telegram bot token.
+- `TGNAS_TELEGRAM_BOT_TOKEN` provides the Telegram bot token in the default Docker-oriented config.
+- `TGNAS_TELEGRAM_CHAT_ID` is the default bucket chat ID reference.
 - `TGNAS_SQLITE_PATH` can override the metadata SQLite path.
-- `TGNAS_PRIVATE_CHAT_ID` is an example bucket chat ID reference.
 
 WebDAV configuration:
 
@@ -41,6 +41,45 @@ webdav:
 ```
 
 The prefix must start with `/`, is normalized to end with `/`, cannot be `/`, and cannot conflict with the first path segment of any configured bucket.
+
+## Docker
+
+Run it with the default Docker-oriented config in `data/config.yaml`:
+
+```bash
+mkdir -p data
+
+docker run --rm -u root -v "$PWD/data:/app/data" ghcr.io/aahl/tgoss chown -R app:app /app/data
+
+docker run -d \
+  --name tgnas \
+  -p 9000:9000 \
+  -v "$PWD/data:/app/data" \
+  -e TGNAS_SECRET_KEY="your-s3-and-webdav-password" \
+  -e TGNAS_TELEGRAM_CHAT_ID="-1001234567890" \
+  -e TGNAS_TELEGRAM_BOT_TOKEN="123456:telegram-bot-token" \
+  ghcr.io/aahl/tgoss
+```
+
+The container runs as a non-root `app` user and uses `/app` as its working directory. The mounted `data` directory must be writable by that container user because SQLite metadata is stored under `/app/data` by default. If SQLite fails to open or create `metadata.sqlite`, fix the host directory ownership or permissions before restarting the container.
+
+## Docker Compose
+
+The included `docker-compose.yml` uses the published GHCR image and mounts `./data` to `/app/data`:
+
+```bash
+cat << EOF > .env
+TGNAS_PORT_EXPOSED=9000
+TGNAS_SECRET_KEY="your-s3-and-webdav-password"
+TGNAS_TELEGRAM_CHAT_ID="-1001234567890"
+TGNAS_TELEGRAM_BOT_TOKEN="123456:telegram-bot-token"
+EOF
+
+docker compose run --rm -u root tgnas chown -R app:app /app/data
+docker compose up -d
+```
+
+If the host `data` directory is owned by root or another user, grant write access to the UID used by the container's `app` user, or use a permissions policy such as a writable group on `./data`. Do not make the config or SQLite directory read-only.
 
 ## Authentication
 

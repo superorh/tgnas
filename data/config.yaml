@@ -42,7 +42,7 @@ webdav:
   # prefix: "/dav/"
 
 buckets:
-  mybucket:
-    chat_id: "-1001234567890"
+  tgnas:
+    chat_id: "${TGNAS_TELEGRAM_CHAT_ID}"
   # private:
-  #   chat_id: "${TGNAS_PRIVATE_CHAT_ID}"
+  #   chat_id: "-1001234567890"

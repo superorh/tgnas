@@ -1,0 +1,13 @@
+services:
+  tgnas:
+    container_name: tgnas
+    image: ghcr.io/aahl/tgoss
+    ports:
+      - "${TGNAS_PORT_EXPOSED:-9000}:9000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      TGNAS_SECRET_KEY: ${TGNAS_SECRET_KEY}
+      TGNAS_TELEGRAM_CHAT_ID: ${TGNAS_TELEGRAM_CHAT_ID}
+      TGNAS_TELEGRAM_BOT_TOKEN: ${TGNAS_TELEGRAM_BOT_TOKEN}
+    restart: unless-stopped
