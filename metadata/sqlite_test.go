@@ -892,6 +892,36 @@ func TestSQLiteDisableBucketsExceptNoopWhenAllKept(t *testing.T) {
 	}
 }
 
+func TestSQLiteCountBucketRenameRowsDoesNotModifyData(t *testing.T) {
+	store := openTestSQLiteStore(t)
+	defer store.Close()
+	ctx := t.Context()
+
+	createdAt := time.Date(2026, 5, 20, 0, 0, 0, 0, time.UTC)
+	if err := store.UpsertBucket(ctx, Bucket{Name: "old", ChatID: "-100111", CreatedAt: createdAt, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutObject(ctx, Object{Bucket: "old", Key: "a.txt", Size: 3, ContentType: "text/plain", ETag: "etag1", SHA256: "sha1", LastModified: createdAt, ChunkCount: 1, TelegramType: "document", UploadStrategy: "single"}, []Chunk{{Bucket: "old", Key: "a.txt", PartNumber: 1, Offset: 0, Size: 3, TelegramType: "document", TelegramFileID: "f1", SHA256: "csha1"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	rename, err := store.CountBucketRenameRows(ctx, "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rename.Buckets != 1 || rename.Objects != 1 || rename.Chunks != 1 {
+		t.Fatalf("unexpected counts: %+v", rename)
+	}
+
+	found, err := store.GetBucket(ctx, "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found.ChatID != "-100111" {
+		t.Fatalf("bucket modified by count: %+v", found)
+	}
+}
+
 func openTestSQLiteStore(t *testing.T) *SQLiteStore {
 	t.Helper()
 

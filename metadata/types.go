@@ -64,6 +64,12 @@ type MoveResult struct {
 	Created bool
 }
 
+type BucketRename struct {
+	Buckets int
+	Objects int
+	Chunks  int
+}
+
 type Store interface {
 	Close() error
 	UpsertBucket(ctx context.Context, bucket Bucket) error
@@ -83,4 +89,6 @@ type Store interface {
 	ListAllObjects(ctx context.Context, bucket, prefix string) ([]Object, error)
 	CountObjects(ctx context.Context, bucket, prefix string) (int, error)
 	DisableBucketsExcept(ctx context.Context, keepNames []string) error
+	CountBucketRenameRows(ctx context.Context, oldName string) (BucketRename, error)
+	RenameBucket(ctx context.Context, oldName, newName string) (BucketRename, error)
 }
