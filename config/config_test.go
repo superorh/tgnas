@@ -65,6 +65,129 @@ buckets:
 	}
 }
 
+func TestLoadConfigReadsBucketPublicRead(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	err := os.WriteFile(path, []byte(`
+auth:
+  credentials:
+    - access_key: "admin"
+      secret_key_env: "SECRET"
+telegram:
+  bot_token_env: "BOT_TOKEN"
+buckets:
+  public:
+    chat_id: "-100123"
+    public_read: true
+  private:
+    chat_id: "-100456"
+`), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile returned error: %v", err)
+	}
+	if !cfg.Buckets["public"].PublicRead {
+		t.Fatalf("public bucket PublicRead = false, want true")
+	}
+	if cfg.Buckets["private"].PublicRead {
+		t.Fatalf("private bucket PublicRead = true, want false")
+	}
+}
+
+func TestLoadConfigReadsTrustedProxySettings(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	err := os.WriteFile(path, []byte(`
+server:
+  trusted_proxies:
+    - "127.0.0.1/32"
+    - "172.16.0.0/12"
+  trusted_proxy_hosts:
+    - "s3.example.com"
+auth:
+  credentials:
+    - access_key: "admin"
+      secret_key_env: "SECRET"
+telegram:
+  bot_token_env: "BOT_TOKEN"
+buckets:
+  tgnas:
+    chat_id: "-100123"
+`), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile returned error: %v", err)
+	}
+	if strings.Join(cfg.Server.TrustedProxies, ",") != "127.0.0.1/32,172.16.0.0/12" {
+		t.Fatalf("trusted proxies = %#v", cfg.Server.TrustedProxies)
+	}
+	if strings.Join(cfg.Server.TrustedProxyHosts, ",") != "s3.example.com" {
+		t.Fatalf("trusted proxy hosts = %#v", cfg.Server.TrustedProxyHosts)
+	}
+}
+
+func TestLoadConfigRejectsInvalidTrustedProxyCIDR(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	err := os.WriteFile(path, []byte(`
+server:
+  trusted_proxies:
+    - "not-a-cidr"
+auth:
+  credentials:
+    - access_key: "admin"
+      secret_key_env: "SECRET"
+telegram:
+  bot_token_env: "BOT_TOKEN"
+buckets:
+  tgnas:
+    chat_id: "-100123"
+`), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = LoadFile(path)
+	if err == nil || !strings.Contains(err.Error(), "server trusted proxy 0 must be a CIDR prefix") {
+		t.Fatalf("LoadFile error = %v", err)
+	}
+}
+
+func TestLoadConfigRejectsEmptyTrustedProxyHost(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	err := os.WriteFile(path, []byte(`
+server:
+  trusted_proxy_hosts:
+    - " "
+auth:
+  credentials:
+    - access_key: "admin"
+      secret_key_env: "SECRET"
+telegram:
+  bot_token_env: "BOT_TOKEN"
+buckets:
+  tgnas:
+    chat_id: "-100123"
+`), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = LoadFile(path)
+	if err == nil || !strings.Contains(err.Error(), "server trusted proxy host 0 is required") {
+		t.Fatalf("LoadFile error = %v", err)
+	}
+}
+
 func TestLoadConfigAllowsDisablingChunking(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")

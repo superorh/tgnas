@@ -33,6 +33,32 @@ Common environment variables:
 - `TGNAS_TELEGRAM_CHAT_ID` is the default bucket chat ID reference.
 - `TGNAS_SQLITE_PATH` can override the metadata SQLite path.
 
+Bucket-level public read can be enabled for anonymous S3 object downloads:
+
+```yaml
+buckets:
+  public-files:
+    chat_id: "${TGNAS_TELEGRAM_CHAT_ID}"
+    public_read: true
+```
+
+`public_read` defaults to `false`. When enabled, anonymous S3 clients may only `GET` and `HEAD` objects in that bucket when they already know the object key. Bucket listing, root bucket listing, writes, deletes, and WebDAV still require authentication.
+
+Trusted proxy configuration for reverse proxies (e.g. cloudflared, nginx):
+
+```yaml
+server:
+  trusted_proxies:
+    - "127.0.0.1/32"
+    - "172.16.0.0/12"
+  trusted_proxy_hosts:
+    - "s3.example.com"
+```
+
+When the request's remote IP matches a `trusted_proxies` CIDR range, `X-Forwarded-Host` (or `Forwarded: host=`) is trusted and applied to the request regardless of the host value. When the forwarded host matches a `trusted_proxy_hosts` entry (case-insensitive), the request is trusted regardless of the remote IP. Either match is sufficient. `X-Forwarded-Proto` (or `Forwarded: proto=`) is also applied when the request is trusted. Without trust, forwarded headers are ignored.
+
+Warning: `trusted_proxy_hosts` trusts the forwarded host value itself, which is client-controlled unless a real proxy strips and sets it. Block direct untrusted access to TgNAS when using it. Prefer `trusted_proxies` CIDR ranges where possible.
+
 WebDAV configuration:
 
 ```yaml
@@ -49,7 +75,7 @@ Run it with the default Docker-oriented config in `data/config.yaml`:
 ```bash
 mkdir -p data
 
-docker run --rm -u root -v "$PWD/data:/app/data" ghcr.io/aahl/tgoss chown -R app:app /app/data
+docker run --rm -u root -v "$PWD/data:/app/data" ghcr.io/aahl/tgnas chown -R app:app /app/data
 
 docker run -d \
   --name tgnas \
@@ -58,7 +84,7 @@ docker run -d \
   -e TGNAS_SECRET_KEY="your-s3-and-webdav-password" \
   -e TGNAS_TELEGRAM_CHAT_ID="-1001234567890" \
   -e TGNAS_TELEGRAM_BOT_TOKEN="123456:telegram-bot-token" \
-  ghcr.io/aahl/tgoss
+  ghcr.io/aahl/tgnas
 ```
 
 The container runs as a non-root `app` user and uses `/app` as its working directory. The mounted `data` directory must be writable by that container user because SQLite metadata is stored under `/app/data` by default. If SQLite fails to open or create `metadata.sqlite`, fix the host directory ownership or permissions before restarting the container.
@@ -83,7 +109,17 @@ If the host `data` directory is owned by root or another user, grant write acces
 
 ## Authentication
 
-S3 keeps SigV4 authentication.
+S3 keeps SigV4 authentication except for anonymous `GET` and `HEAD` object requests against buckets configured with `public_read: true`.
+
+S3 object `GET` and `HEAD` requests may also use SigV4 query-string authentication, commonly called presigned URLs. Presigned URLs use the existing configured credentials and support `X-Amz-Expires` values up to `604800` seconds (7 days). Presigned URLs do not authorize bucket listing, root listing, writes, deletes, copy operations, or WebDAV requests.
+
+A presigned object URL has the same path-style shape as normal S3 object access:
+
+```text
+https://s3.example.com/tgnas/test.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=...&X-Amz-Date=...&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=...
+```
+
+If TgNAS is behind a reverse proxy that changes the origin host, configure `trusted_proxies` or `trusted_proxy_hosts` so the verifier sees the external host that was signed.
 
 WebDAV uses HTTP Basic Auth and reuses `auth.credentials`:
 

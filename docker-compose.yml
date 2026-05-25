@@ -1,7 +1,7 @@
 services:
   tgnas:
     container_name: tgnas
-    image: ghcr.io/aahl/tgoss
+    image: ghcr.io/aahl/tgnas
     ports:
       - "${TGNAS_PORT_EXPOSED:-9000}:9000"
     volumes:

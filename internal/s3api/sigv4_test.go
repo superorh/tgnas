@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -206,6 +207,140 @@ func TestVerifySigV4RejectsModifiedBodyAfterSigning(t *testing.T) {
 	}
 }
 
+func TestVerifySigV4PresignedGetAndHead(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		t.Run(method, func(t *testing.T) {
+			request := presignedTestRequest(t, presignedRequestOptions{method: method})
+			verifier := NewSigV4Verifier("us-east-1", map[string]string{"AKID": "SECRET"}, WithSigV4Clock(func() time.Time { return time.Date(2024, 1, 2, 3, 5, 0, 0, time.UTC) }))
+
+			identity, err := verifier.Verify(request)
+			if err != nil {
+				t.Fatalf("Verify returned error: %v", err)
+			}
+			if identity.AccessKey != "AKID" {
+				t.Fatalf("identity = %+v", identity)
+			}
+			if !identity.Presigned {
+				t.Fatalf("identity = %+v, want Presigned true", identity)
+			}
+		})
+	}
+}
+
+func TestVerifySigV4PresignedResponseOverrideIsSigned(t *testing.T) {
+	request := presignedTestRequest(t, presignedRequestOptions{responseContentDisposition: "attachment; filename*=UTF-8''hello.txt"})
+	verifier := NewSigV4Verifier("us-east-1", map[string]string{"AKID": "SECRET"}, WithSigV4Clock(func() time.Time { return time.Date(2024, 1, 2, 3, 5, 0, 0, time.UTC) }))
+
+	identity, err := verifier.Verify(request)
+	if err != nil {
+		t.Fatalf("Verify returned error: %v", err)
+	}
+	if identity.AccessKey != "AKID" {
+		t.Fatalf("identity = %+v", identity)
+	}
+	if !identity.Presigned {
+		t.Fatalf("identity = %+v, want Presigned true", identity)
+	}
+
+	tampered := request.Clone(request.Context())
+	tampered.Host = request.Host
+	query := tampered.URL.Query()
+	query.Set("response-content-disposition", "attachment; filename*=UTF-8''tampered.txt")
+	tampered.URL.RawQuery = query.Encode()
+
+	_, err = verifier.Verify(tampered)
+	if err != ErrSignatureDoesNotMatch {
+		t.Fatalf("err = %v, want ErrSignatureDoesNotMatch", err)
+	}
+}
+
+func TestVerifySigV4PresignedRejectsMissingRequiredQueryParameter(t *testing.T) {
+	for _, key := range []string{
+		"X-Amz-Algorithm",
+		"X-Amz-Credential",
+		"X-Amz-Date",
+		"X-Amz-Expires",
+		"X-Amz-SignedHeaders",
+		"X-Amz-Signature",
+	} {
+		t.Run(key, func(t *testing.T) {
+			request := presignedTestRequest(t, presignedRequestOptions{})
+			query := request.URL.Query()
+			query.Del(key)
+			request.URL.RawQuery = query.Encode()
+
+			verifier := NewSigV4Verifier("us-east-1", map[string]string{"AKID": "SECRET"}, WithSigV4Clock(func() time.Time { return time.Date(2024, 1, 2, 3, 5, 0, 0, time.UTC) }))
+			_, err := verifier.Verify(request)
+			if err != ErrSignatureDoesNotMatch {
+				t.Fatalf("err = %v, want ErrSignatureDoesNotMatch", err)
+			}
+		})
+	}
+}
+
+func TestVerifySigV4PresignedRejectsExpiredURL(t *testing.T) {
+	request := presignedTestRequest(t, presignedRequestOptions{expires: time.Minute})
+	verifier := NewSigV4Verifier("us-east-1", map[string]string{"AKID": "SECRET"}, WithSigV4Clock(func() time.Time { return time.Date(2024, 1, 2, 3, 5, 6, 0, time.UTC) }))
+
+	_, err := verifier.Verify(request)
+	if err != ErrSignatureDoesNotMatch {
+		t.Fatalf("err = %v, want ErrSignatureDoesNotMatch", err)
+	}
+}
+
+func TestVerifySigV4PresignedRejectsExpiresAboveSevenDays(t *testing.T) {
+	request := presignedTestRequest(t, presignedRequestOptions{expires: 7*24*time.Hour + time.Second})
+	verifier := NewSigV4Verifier("us-east-1", map[string]string{"AKID": "SECRET"}, WithSigV4Clock(func() time.Time { return time.Date(2024, 1, 2, 3, 5, 0, 0, time.UTC) }))
+
+	_, err := verifier.Verify(request)
+	if err != ErrSignatureDoesNotMatch {
+		t.Fatalf("err = %v, want ErrSignatureDoesNotMatch", err)
+	}
+}
+
+func TestVerifySigV4PresignedRejectsWrongRegionServiceAndAccessKey(t *testing.T) {
+	verifier := NewSigV4Verifier("us-east-1", map[string]string{"AKID": "SECRET"}, WithSigV4Clock(func() time.Time { return time.Date(2024, 1, 2, 3, 5, 0, 0, time.UTC) }))
+
+	for _, tc := range []struct {
+		name    string
+		request *http.Request
+		wantErr error
+	}{
+		{
+			name:    "wrong region",
+			request: presignedTestRequest(t, presignedRequestOptions{region: "eu-west-1"}),
+			wantErr: ErrSignatureDoesNotMatch,
+		},
+		{
+			name:    "wrong service",
+			request: presignedTestRequest(t, presignedRequestOptions{service: "ec2"}),
+			wantErr: ErrSignatureDoesNotMatch,
+		},
+		{
+			name:    "unknown access key",
+			request: presignedTestRequest(t, presignedRequestOptions{accessKey: "UNKNOWN"}),
+			wantErr: ErrInvalidAccessKeyID,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := verifier.Verify(tc.request)
+			if err != tc.wantErr {
+				t.Fatalf("err = %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+type presignedRequestOptions struct {
+	method                     string
+	accessKey                  string
+	secret                     string
+	region                     string
+	service                    string
+	expires                    time.Duration
+	responseContentDisposition string
+}
+
 type signedRequestOptions struct {
 	accessKey string
 	secret    string
@@ -214,6 +349,56 @@ type signedRequestOptions struct {
 	method    string
 	rawQuery  string
 	body      []byte
+}
+
+func presignedTestRequest(t *testing.T, opts presignedRequestOptions) *http.Request {
+	t.Helper()
+
+	method := opts.method
+	if method == "" {
+		method = http.MethodGet
+	}
+	accessKey := opts.accessKey
+	if accessKey == "" {
+		accessKey = "AKID"
+	}
+	secret := opts.secret
+	if secret == "" {
+		secret = "SECRET"
+	}
+	region := opts.region
+	if region == "" {
+		region = "us-east-1"
+	}
+	service := opts.service
+	if service == "" {
+		service = "s3"
+	}
+	expires := opts.expires
+	if expires == 0 {
+		expires = 15 * time.Minute
+	}
+
+	request := httptest.NewRequest(method, "https://example.com/photos/hello.txt", nil)
+	request.Host = "example.com"
+	query := request.URL.Query()
+	query.Set("X-Amz-Expires", strconv.FormatInt(int64(expires/time.Second), 10))
+	if opts.responseContentDisposition != "" {
+		query.Set("response-content-disposition", opts.responseContentDisposition)
+	}
+	request.URL.RawQuery = query.Encode()
+
+	credentials := aws.Credentials{AccessKeyID: accessKey, SecretAccessKey: secret}
+	signedURL, _, err := v4.NewSigner().PresignHTTP(context.Background(), credentials, request, "UNSIGNED-PAYLOAD", service, region, time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC), func(o *v4.SignerOptions) {
+		o.DisableURIPathEscaping = true
+	})
+	if err != nil {
+		t.Fatalf("PresignHTTP returned error: %v", err)
+	}
+
+	presigned := httptest.NewRequest(method, signedURL, nil)
+	presigned.Host = "example.com"
+	return presigned
 }
 
 func signedTestRequest(t *testing.T, opts signedRequestOptions) *http.Request {

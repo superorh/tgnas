@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -102,6 +103,210 @@ func TestPutHeadGetDeleteObject(t *testing.T) {
 	server.ServeHTTP(deleteReq.recorder, deleteReq.request)
 	if deleteReq.recorder.Code != http.StatusNoContent {
 		t.Fatalf("delete status = %d", deleteReq.recorder.Code)
+	}
+}
+
+func TestPresignedObjectGetAndHead(t *testing.T) {
+	server := newSignedTestServer(t)
+
+	put := signedRecorderRequest(t, http.MethodPut, "/photos/presigned.txt", "hello", map[string]string{"Content-Type": "text/plain"})
+	server.ServeHTTP(put.recorder, put.request)
+	if put.recorder.Code != http.StatusOK {
+		t.Fatalf("put status = %d body = %s", put.recorder.Code, put.recorder.Body.String())
+	}
+
+	getRecorder := httptest.NewRecorder()
+	getRequest := presignServerRequest(t, http.MethodGet, "/photos/presigned.txt", 0)
+	server.ServeHTTP(getRecorder, getRequest)
+	if getRecorder.Code != http.StatusOK || getRecorder.Body.String() != "hello" {
+		t.Fatalf("presigned get status = %d body = %q", getRecorder.Code, getRecorder.Body.String())
+	}
+	if getRecorder.Header().Get("Content-Type") != "text/plain" {
+		t.Fatalf("presigned get headers = %v", getRecorder.Header())
+	}
+
+	headRecorder := httptest.NewRecorder()
+	headRequest := presignServerRequest(t, http.MethodHead, "/photos/presigned.txt", 0)
+	server.ServeHTTP(headRecorder, headRequest)
+	if headRecorder.Code != http.StatusOK || headRecorder.Body.Len() != 0 {
+		t.Fatalf("presigned head status = %d body = %q", headRecorder.Code, headRecorder.Body.String())
+	}
+	if headRecorder.Header().Get("Content-Length") != "5" {
+		t.Fatalf("presigned head headers = %v", headRecorder.Header())
+	}
+}
+
+func TestPresignedUnsupportedOperationsFail(t *testing.T) {
+	server := newSignedTestServer(t)
+
+	for _, tc := range []struct {
+		method    string
+		path      string
+		bodyEmpty bool
+	}{
+		{method: http.MethodGet, path: "/"},
+		{method: http.MethodGet, path: "/photos"},
+		{method: http.MethodHead, path: "/photos", bodyEmpty: true},
+		{method: http.MethodPut, path: "/photos/presigned.txt"},
+		{method: http.MethodDelete, path: "/photos/presigned.txt"},
+	} {
+		recorder := httptest.NewRecorder()
+		request := presignServerRequest(t, tc.method, tc.path, 0)
+		server.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusForbidden {
+			t.Fatalf("presigned %s %s status = %d body = %s", tc.method, tc.path, recorder.Code, recorder.Body.String())
+		}
+		if tc.bodyEmpty {
+			if recorder.Body.Len() != 0 {
+				t.Fatalf("presigned %s %s body length = %d, want 0", tc.method, tc.path, recorder.Body.Len())
+			}
+			continue
+		}
+		if !strings.Contains(recorder.Body.String(), "<Code>SignatureDoesNotMatch</Code>") {
+			t.Fatalf("presigned %s %s body = %s", tc.method, tc.path, recorder.Body.String())
+		}
+	}
+}
+
+func TestPublicReadAllowsAnonymousObjectGetAndHead(t *testing.T) {
+	server := newPublicReadTestServer(t, map[string]bool{"photos": true})
+
+	put := signedRecorderRequest(t, http.MethodPut, "/photos/public.txt", "hello", map[string]string{"Content-Type": "text/plain"})
+	server.ServeHTTP(put.recorder, put.request)
+	if put.recorder.Code != http.StatusOK {
+		t.Fatalf("put status = %d body = %s", put.recorder.Code, put.recorder.Body.String())
+	}
+
+	getRecorder := httptest.NewRecorder()
+	getRequest := httptest.NewRequest(http.MethodGet, "/photos/public.txt", nil)
+	server.ServeHTTP(getRecorder, getRequest)
+	if getRecorder.Code != http.StatusOK || getRecorder.Body.String() != "hello" {
+		t.Fatalf("anonymous get status = %d body = %q", getRecorder.Code, getRecorder.Body.String())
+	}
+	if getRecorder.Header().Get("Content-Type") != "text/plain" {
+		t.Fatalf("anonymous get headers = %v", getRecorder.Header())
+	}
+
+	headRecorder := httptest.NewRecorder()
+	headRequest := httptest.NewRequest(http.MethodHead, "/photos/public.txt", nil)
+	server.ServeHTTP(headRecorder, headRequest)
+	if headRecorder.Code != http.StatusOK || headRecorder.Body.Len() != 0 {
+		t.Fatalf("anonymous head status = %d body = %q", headRecorder.Code, headRecorder.Body.String())
+	}
+	if headRecorder.Header().Get("Content-Length") != "5" || headRecorder.Header().Get("Content-Type") != "text/plain" {
+		t.Fatalf("anonymous head headers = %v", headRecorder.Header())
+	}
+}
+
+func TestPublicReadKeepsPrivateObjectsAuthenticated(t *testing.T) {
+	server := newPublicReadTestServer(t, map[string]bool{"photos": true})
+
+	put := signedRecorderRequest(t, http.MethodPut, "/backups/private.txt", "secret", nil)
+	server.ServeHTTP(put.recorder, put.request)
+	if put.recorder.Code != http.StatusOK {
+		t.Fatalf("put status = %d body = %s", put.recorder.Code, put.recorder.Body.String())
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/backups/private.txt", nil)
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden || !strings.Contains(recorder.Body.String(), "<Code>SignatureDoesNotMatch</Code>") {
+		t.Fatalf("anonymous private get status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPublicReadDoesNotExposeBucketListing(t *testing.T) {
+	server := newPublicReadTestServer(t, map[string]bool{"photos": true})
+
+	put := signedRecorderRequest(t, http.MethodPut, "/photos/public.txt", "hello", nil)
+	server.ServeHTTP(put.recorder, put.request)
+	if put.recorder.Code != http.StatusOK {
+		t.Fatalf("put status = %d body = %s", put.recorder.Code, put.recorder.Body.String())
+	}
+
+	for _, path := range []string{"/", "/photos", "/photos?list-type=2"} {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		server.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusForbidden || !strings.Contains(recorder.Body.String(), "<Code>SignatureDoesNotMatch</Code>") {
+			t.Fatalf("anonymous list %s status = %d body = %s", path, recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
+func TestPublicReadDoesNotAllowAnonymousWrites(t *testing.T) {
+	server := newPublicReadTestServer(t, map[string]bool{"photos": true})
+
+	for _, tc := range []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{method: http.MethodPut, path: "/photos/public.txt", body: "replace"},
+		{method: http.MethodDelete, path: "/photos/public.txt"},
+	} {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+		server.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusForbidden || !strings.Contains(recorder.Body.String(), "<Code>SignatureDoesNotMatch</Code>") {
+			t.Fatalf("anonymous %s status = %d body = %s", tc.method, recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
+func TestPublicReadDoesNotBypassPresignedQueryAuth(t *testing.T) {
+	server := newPublicReadTestServer(t, map[string]bool{"photos": true})
+
+	put := signedRecorderRequest(t, http.MethodPut, "/photos/public.txt", "hello", map[string]string{"Content-Type": "text/plain"})
+	server.ServeHTTP(put.recorder, put.request)
+	if put.recorder.Code != http.StatusOK {
+		t.Fatalf("put status = %d body = %s", put.recorder.Code, put.recorder.Body.String())
+	}
+
+	request := presignServerRequest(t, http.MethodGet, "/photos/public.txt", 15*time.Minute)
+	query := request.URL.Query()
+	query.Set("response-content-disposition", "tampered")
+	request.URL.RawQuery = query.Encode()
+
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden || !strings.Contains(recorder.Body.String(), "<Code>SignatureDoesNotMatch</Code>") {
+		t.Fatalf("tampered presigned get status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPublicReadDoesNotBypassIncompletePresignedQueryAuth(t *testing.T) {
+	server := newPublicReadTestServer(t, map[string]bool{"photos": true})
+
+	put := signedRecorderRequest(t, http.MethodPut, "/photos/public.txt", "hello", map[string]string{"Content-Type": "text/plain"})
+	server.ServeHTTP(put.recorder, put.request)
+	if put.recorder.Code != http.StatusOK {
+		t.Fatalf("put status = %d body = %s", put.recorder.Code, put.recorder.Body.String())
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/photos/public.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256", nil)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden || !strings.Contains(recorder.Body.String(), "<Code>SignatureDoesNotMatch</Code>") {
+		t.Fatalf("incomplete presigned get status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPublicReadDoesNotBypassSigV4HeaderAuth(t *testing.T) {
+	server := newPublicReadTestServer(t, map[string]bool{"photos": true})
+
+	put := signedRecorderRequest(t, http.MethodPut, "/photos/public.txt", "hello", map[string]string{"Content-Type": "text/plain"})
+	server.ServeHTTP(put.recorder, put.request)
+	if put.recorder.Code != http.StatusOK {
+		t.Fatalf("put status = %d body = %s", put.recorder.Code, put.recorder.Body.String())
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/photos/public.txt", nil)
+	request.Header.Set("X-Amz-Security-Token", "token")
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden || !strings.Contains(recorder.Body.String(), "<Code>SignatureDoesNotMatch</Code>") {
+		t.Fatalf("sigv4-shaped header get status = %d body = %s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -520,6 +725,33 @@ func newSignedTestServer(t *testing.T) http.Handler {
 	return NewServer(objectStore, Options{Region: "us-east-1", Credentials: map[string]string{"AKID": "SECRET"}, SigV4Clock: func() time.Time { return time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC) }, Ready: func() bool { return true }})
 }
 
+func newPublicReadTestServer(t *testing.T, publicReadBuckets map[string]bool) http.Handler {
+	t.Helper()
+	ctx := context.Background()
+	meta, err := metadata.OpenSQLite(filepath.Join(t.TempDir(), "metadata.sqlite"))
+	if err != nil {
+		t.Fatalf("OpenSQLite returned error: %v", err)
+	}
+	t.Cleanup(func() { _ = meta.Close() })
+	for name, chatID := range map[string]string{"photos": "-100", "backups": "-200"} {
+		if err := meta.UpsertBucket(ctx, metadata.Bucket{Name: name, ChatID: chatID, CreatedAt: time.Now().UTC(), Enabled: true}); err != nil {
+			t.Fatalf("UpsertBucket(%s) returned error: %v", name, err)
+		}
+	}
+	fake := testutil.NewFakeTelegram()
+	objectStore, err := store.NewObjectStore(meta, fake, store.Options{Upload: store.DefaultUploadConfig()})
+	if err != nil {
+		t.Fatalf("NewObjectStore returned error: %v", err)
+	}
+	return NewServer(objectStore, Options{
+		Region:            "us-east-1",
+		Credentials:       map[string]string{"AKID": "SECRET"},
+		PublicReadBuckets: publicReadBuckets,
+		SigV4Clock:        func() time.Time { return time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC) },
+		Ready:             func() bool { return true },
+	})
+}
+
 func signedRecorderRequest(t *testing.T, method, path, body string, headers map[string]string) signedHTTPTest {
 	t.Helper()
 	request := httptest.NewRequest(method, path, strings.NewReader(body))
@@ -541,6 +773,30 @@ func signedUnsignedPayloadRecorderRequest(t *testing.T, method, path, body strin
 	request.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
 	signRequest(t, request, "AKID", "SECRET")
 	return signedHTTPTest{recorder: httptest.NewRecorder(), request: request}
+}
+
+func presignServerRequest(t *testing.T, method, target string, expires time.Duration) *http.Request {
+	t.Helper()
+	if expires == 0 {
+		expires = 15 * time.Minute
+	}
+	request := httptest.NewRequest(method, "https://example.com"+target, nil)
+	request.Host = "example.com"
+	query := request.URL.Query()
+	query.Set("X-Amz-Expires", strconv.FormatInt(int64(expires/time.Second), 10))
+	request.URL.RawQuery = query.Encode()
+
+	credentials := aws.Credentials{AccessKeyID: "AKID", SecretAccessKey: "SECRET"}
+	signedURL, _, err := v4.NewSigner().PresignHTTP(context.Background(), credentials, request, "UNSIGNED-PAYLOAD", "s3", "us-east-1", time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC), func(options *v4.SignerOptions) {
+		options.DisableURIPathEscaping = true
+	})
+	if err != nil {
+		t.Fatalf("PresignHTTP returned error: %v", err)
+	}
+
+	presigned := httptest.NewRequest(method, signedURL, nil)
+	presigned.Host = "example.com"
+	return presigned
 }
 
 func signRequest(t *testing.T, request *http.Request, accessKey, secret string) {

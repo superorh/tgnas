@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"strings"
 	"time"
@@ -37,9 +38,11 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Listen        string `yaml:"listen"`
-	ListenEnv     string `yaml:"listen_env"`
-	PublicBaseURL string `yaml:"public_base_url"`
+	Listen            string   `yaml:"listen"`
+	ListenEnv         string   `yaml:"listen_env"`
+	PublicBaseURL     string   `yaml:"public_base_url"`
+	TrustedProxies    []string `yaml:"trusted_proxies"`
+	TrustedProxyHosts []string `yaml:"trusted_proxy_hosts"`
 }
 
 type AuthConfig struct {
@@ -79,7 +82,8 @@ type StorageConfig struct {
 }
 
 type BucketConfig struct {
-	ChatID string `yaml:"chat_id"`
+	ChatID     string `yaml:"chat_id"`
+	PublicRead bool   `yaml:"public_read"`
 }
 
 type WebDAVConfig struct {
@@ -215,6 +219,16 @@ func (c Config) ResolveSQLitePath() (string, error) {
 func (c Config) Validate() error {
 	if strings.TrimSpace(c.ResolveListen()) == "" {
 		return fmt.Errorf("server listen is required")
+	}
+	for i, value := range c.Server.TrustedProxies {
+		if _, err := netip.ParsePrefix(strings.TrimSpace(value)); err != nil {
+			return fmt.Errorf("server trusted proxy %d must be a CIDR prefix: %w", i, err)
+		}
+	}
+	for i, value := range c.Server.TrustedProxyHosts {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("server trusted proxy host %d is required", i)
+		}
 	}
 
 	if strings.TrimSpace(c.Auth.Region) == "" {

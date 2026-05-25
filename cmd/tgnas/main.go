@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -442,6 +444,142 @@ func run(configPath string) error {
 	return runServiceWithDebug(configPath, serverModeAll, newDebugLogger(false, io.Discard))
 }
 
+func publicReadBucketsFromConfig(cfg config.Config) map[string]bool {
+	publicReadBuckets := map[string]bool{}
+	for name, bucket := range cfg.Buckets {
+		if bucket.PublicRead {
+			publicReadBuckets[name] = true
+		}
+	}
+	return publicReadBuckets
+}
+
+type trustedProxyMiddleware struct {
+	next  http.Handler
+	trust trustedProxyTrust
+}
+
+type trustedProxyTrust struct {
+	proxies []netip.Prefix
+	hosts   map[string]struct{}
+}
+
+func newTrustedProxyMiddleware(next http.Handler, server config.ServerConfig) (http.Handler, error) {
+	trust, err := newTrustedProxyTrust(server)
+	if err != nil {
+		return nil, err
+	}
+	if len(trust.proxies) == 0 && len(trust.hosts) == 0 {
+		return next, nil
+	}
+	return trustedProxyMiddleware{next: next, trust: trust}, nil
+}
+
+func newTrustedProxyTrust(server config.ServerConfig) (trustedProxyTrust, error) {
+	trust := trustedProxyTrust{hosts: map[string]struct{}{}}
+	for i, value := range server.TrustedProxies {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(value))
+		if err != nil {
+			return trustedProxyTrust{}, fmt.Errorf("parse trusted proxy %d: %w", i, err)
+		}
+		trust.proxies = append(trust.proxies, prefix)
+	}
+	for _, host := range server.TrustedProxyHosts {
+		normalized := normalizeForwardedHost(host)
+		if normalized != "" {
+			trust.hosts[normalized] = struct{}{}
+		}
+	}
+	return trust, nil
+}
+
+func (m trustedProxyMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	forwardedHost := forwardedHost(r)
+	forwardedProto := forwardedProto(r)
+	if forwardedHost == "" && forwardedProto == "" {
+		m.next.ServeHTTP(w, r)
+		return
+	}
+	if !m.trust.trusts(r, forwardedHost) {
+		m.next.ServeHTTP(w, r)
+		return
+	}
+
+	clone := r.Clone(r.Context())
+	if forwardedHost != "" {
+		normalized := normalizeForwardedHost(forwardedHost)
+		clone.Host = normalized
+		clone.URL.Host = normalized
+	}
+	if forwardedProto != "" {
+		clone.URL.Scheme = strings.ToLower(forwardedProto)
+	}
+	m.next.ServeHTTP(w, clone)
+}
+
+func (t trustedProxyTrust) trusts(r *http.Request, forwardedHost string) bool {
+	if t.trustsRemoteAddr(r.RemoteAddr) {
+		return true
+	}
+	if forwardedHost == "" {
+		return false
+	}
+	_, ok := t.hosts[normalizeForwardedHost(forwardedHost)]
+	return ok
+}
+
+func (t trustedProxyTrust) trustsRemoteAddr(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	addr, err := netip.ParseAddr(strings.TrimSpace(host))
+	if err != nil {
+		return false
+	}
+	for _, prefix := range t.proxies {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func forwardedHost(r *http.Request) string {
+	if value := firstForwardedValue(r.Header.Get("X-Forwarded-Host")); value != "" {
+		return value
+	}
+	return forwardedHeaderParam(r.Header.Get("Forwarded"), "host")
+}
+
+func forwardedProto(r *http.Request) string {
+	if value := firstForwardedValue(r.Header.Get("X-Forwarded-Proto")); value != "" {
+		return value
+	}
+	return forwardedHeaderParam(r.Header.Get("Forwarded"), "proto")
+}
+
+func firstForwardedValue(value string) string {
+	first, _, _ := strings.Cut(value, ",")
+	return strings.Trim(strings.TrimSpace(first), `"`)
+}
+
+func forwardedHeaderParam(header, name string) string {
+	firstElement, _, _ := strings.Cut(header, ",")
+	for _, part := range strings.Split(firstElement, ";") {
+		key, value, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if !ok || !strings.EqualFold(strings.TrimSpace(key), name) {
+			continue
+		}
+		return strings.Trim(strings.TrimSpace(value), `"`)
+	}
+	return ""
+}
+
+func normalizeForwardedHost(host string) string {
+	return strings.ToLower(strings.Trim(strings.TrimSpace(host), `"`))
+}
+
 type combinedHandler struct {
 	s3      http.Handler
 	dav     http.Handler
@@ -558,10 +696,11 @@ func runServiceWithDebug(configPath string, mode serverMode, dbg debugLogger) er
 
 	var handler http.Handler
 	s3Handler := s3api.NewServer(objectStore, s3api.Options{
-		Region:      cfg.Auth.Region,
-		Credentials: secrets,
-		Ready:       ready.Load,
-		Logger:      dbg.StdLogger(),
+		Region:            cfg.Auth.Region,
+		Credentials:       secrets,
+		PublicReadBuckets: publicReadBucketsFromConfig(cfg),
+		Ready:             ready.Load,
+		Logger:            dbg.StdLogger(),
 	})
 	if mode == serverModeS3 {
 		handler = s3Handler
@@ -580,6 +719,11 @@ func runServiceWithDebug(configPath string, mode serverMode, dbg debugLogger) er
 		default:
 			return fmt.Errorf("unknown server mode: %s", mode)
 		}
+	}
+
+	handler, err = newTrustedProxyMiddleware(handler, cfg.Server)
+	if err != nil {
+		return fmt.Errorf("configure trusted proxy middleware: %w", err)
 	}
 
 	listenAddr := cfg.ResolveListen()

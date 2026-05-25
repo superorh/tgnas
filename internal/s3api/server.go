@@ -29,19 +29,21 @@ type ObjectStore interface {
 }
 
 type Options struct {
-	Region       string
-	Credentials  map[string]string
-	Ready        func() bool
-	SigV4Clock   func() time.Time
-	SigV4MaxSkew time.Duration
-	Logger       *log.Logger
+	Region            string
+	Credentials       map[string]string
+	PublicReadBuckets map[string]bool
+	Ready             func() bool
+	SigV4Clock        func() time.Time
+	SigV4MaxSkew      time.Duration
+	Logger            *log.Logger
 }
 
 type Server struct {
-	store  ObjectStore
-	ready  func() bool
-	verify *SigV4Verifier
-	logger *log.Logger
+	store             ObjectStore
+	ready             func() bool
+	verify            *SigV4Verifier
+	publicReadBuckets map[string]bool
+	logger            *log.Logger
 }
 
 func NewServer(objectStore ObjectStore, options Options) http.Handler {
@@ -60,11 +62,18 @@ func NewServer(objectStore ObjectStore, options Options) http.Handler {
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
+	publicReadBuckets := make(map[string]bool, len(options.PublicReadBuckets))
+	for bucket, publicRead := range options.PublicReadBuckets {
+		if publicRead {
+			publicReadBuckets[bucket] = true
+		}
+	}
 	return &Server{
-		store:  objectStore,
-		ready:  ready,
-		verify: NewSigV4Verifier(options.Region, options.Credentials, verifierOptions...),
-		logger: logger,
+		store:             objectStore,
+		ready:             ready,
+		verify:            NewSigV4Verifier(options.Region, options.Credentials, verifierOptions...),
+		publicReadBuckets: publicReadBuckets,
+		logger:            logger,
 	}
 }
 
@@ -101,9 +110,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("X-Amz-Content-Sha256") == "UNSIGNED-PAYLOAD" {
 		s.logger.Printf("debug event=s3_unsigned_payload method=%q path=%q accepted=true", r.Method, r.URL.Path)
 	}
-	if _, err := s.verify.Verify(r); err != nil {
-		WriteErrorResponse(w, r, MapError(err), r.URL.Path, "")
-		return
+	if !s.allowsAnonymousPublicRead(r) {
+		identity, err := s.verify.Verify(r)
+		if err != nil {
+			WriteErrorResponse(w, r, MapError(err), r.URL.Path, "")
+			return
+		}
+		if identity.Presigned && !allowsPresignedRequest(r) {
+			WriteErrorResponse(w, r, ErrSignatureMismatch, r.URL.Path, "")
+			return
+		}
 	}
 
 	bucket, key, hasBucket := splitPath(r.URL)
@@ -121,6 +137,46 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.handleObject(w, r, bucket, key)
+}
+
+func allowsPresignedRequest(r *http.Request) bool {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	_, key, hasBucket := splitPath(r.URL)
+	return hasBucket && key != ""
+}
+
+func hasSigV4Header(r *http.Request) bool {
+	for name := range r.Header {
+		if strings.HasPrefix(strings.ToLower(name), "x-amz-") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSigV4QueryAuth(r *http.Request) bool {
+	for key := range r.URL.Query() {
+		if strings.HasPrefix(strings.ToLower(key), "x-amz-") {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) allowsAnonymousPublicRead(r *http.Request) bool {
+	if r.Header.Get("Authorization") != "" || hasSigV4Header(r) || hasSigV4QueryAuth(r) {
+		return false
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	bucket, key, hasBucket := splitPath(r.URL)
+	if !hasBucket || key == "" {
+		return false
+	}
+	return s.publicReadBuckets[bucket]
 }
 
 func shouldServeHTMLRoot(r *http.Request) bool {

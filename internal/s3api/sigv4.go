@@ -19,6 +19,7 @@ const EmptyPayloadSHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495
 
 type Identity struct {
 	AccessKey string
+	Presigned bool
 }
 
 type SigV4Verifier struct {
@@ -49,6 +50,9 @@ type sigV4Authorization struct {
 	service       string
 	signedHeaders []string
 	signature     string
+	xAmzDate      string
+	expires       time.Duration
+	presigned     bool
 }
 
 func NewSigV4Verifier(region string, keys map[string]string, opts ...SigV4VerifierOption) *SigV4Verifier {
@@ -64,12 +68,15 @@ func NewSigV4Verifier(region string, keys map[string]string, opts ...SigV4Verifi
 }
 
 func (v *SigV4Verifier) Verify(r *http.Request) (Identity, error) {
-	auth, err := parseSigV4Authorization(r.Header.Get("Authorization"))
+	auth, err := parseSigV4RequestAuth(r)
 	if err != nil {
 		return Identity{}, ErrSignatureDoesNotMatch
 	}
 	if auth.region != v.region || auth.service != "s3" {
 		return Identity{}, ErrSignatureDoesNotMatch
+	}
+	if auth.accessKey == "" {
+		return Identity{}, ErrInvalidAccessKeyID
 	}
 
 	secret, ok := v.keys[auth.accessKey]
@@ -77,20 +84,26 @@ func (v *SigV4Verifier) Verify(r *http.Request) (Identity, error) {
 		return Identity{}, ErrInvalidAccessKeyID
 	}
 
-	xAmzDate := r.Header.Get("X-Amz-Date")
-	if xAmzDate == "" {
+	if auth.xAmzDate == "" {
 		return Identity{}, ErrSignatureDoesNotMatch
 	}
-	if err := v.validateRequestTime(xAmzDate, auth.date); err != nil {
+	if auth.presigned {
+		if err := v.validatePresignedRequestTime(auth.xAmzDate, auth.date, auth.expires); err != nil {
+			return Identity{}, ErrSignatureDoesNotMatch
+		}
+	} else if err := v.validateRequestTime(auth.xAmzDate, auth.date); err != nil {
 		return Identity{}, ErrSignatureDoesNotMatch
 	}
 
-	payloadHash, err := payloadHash(r)
-	if err != nil {
-		return Identity{}, ErrSignatureDoesNotMatch
+	canonicalPayloadHash := "UNSIGNED-PAYLOAD"
+	if !auth.presigned {
+		canonicalPayloadHash, err = payloadHash(r)
+		if err != nil {
+			return Identity{}, ErrSignatureDoesNotMatch
+		}
 	}
 
-	canonicalRequest, err := buildCanonicalRequest(r, auth.signedHeaders, payloadHash)
+	canonicalRequest, err := buildCanonicalRequest(r, auth.signedHeaders, canonicalPayloadHash, auth.presigned)
 	if err != nil {
 		return Identity{}, ErrSignatureDoesNotMatch
 	}
@@ -98,7 +111,7 @@ func (v *SigV4Verifier) Verify(r *http.Request) (Identity, error) {
 	credentialScope := strings.Join([]string{auth.date, auth.region, auth.service, "aws4_request"}, "/")
 	stringToSign := strings.Join([]string{
 		"AWS4-HMAC-SHA256",
-		xAmzDate,
+		auth.xAmzDate,
 		credentialScope,
 		hexSHA256(canonicalRequest),
 	}, "\n")
@@ -109,7 +122,7 @@ func (v *SigV4Verifier) Verify(r *http.Request) (Identity, error) {
 		return Identity{}, ErrSignatureDoesNotMatch
 	}
 
-	return Identity{AccessKey: auth.accessKey}, nil
+	return Identity{AccessKey: auth.accessKey, Presigned: auth.presigned}, nil
 }
 
 func (v *SigV4Verifier) validateRequestTime(xAmzDate, scopeDate string) error {
@@ -128,6 +141,36 @@ func (v *SigV4Verifier) validateRequestTime(xAmzDate, scopeDate string) error {
 		return fmt.Errorf("request timestamp outside allowed skew")
 	}
 	return nil
+}
+
+func (v *SigV4Verifier) validatePresignedRequestTime(xAmzDate, scopeDate string, expires time.Duration) error {
+	signedAt, err := time.Parse("20060102T150405Z", xAmzDate)
+	if err != nil {
+		return err
+	}
+	if scopeDate != signedAt.UTC().Format("20060102") {
+		return fmt.Errorf("credential scope date does not match request timestamp")
+	}
+	now := v.clock().UTC()
+	if v.maxSkew > 0 && signedAt.After(now.Add(v.maxSkew)) {
+		return fmt.Errorf("request timestamp outside allowed skew")
+	}
+	if now.After(signedAt.Add(expires)) {
+		return fmt.Errorf("request expired")
+	}
+	return nil
+}
+
+func parseSigV4RequestAuth(r *http.Request) (sigV4Authorization, error) {
+	if header := r.Header.Get("Authorization"); header != "" {
+		auth, err := parseSigV4Authorization(header)
+		if err != nil {
+			return sigV4Authorization{}, err
+		}
+		auth.xAmzDate = r.Header.Get("X-Amz-Date")
+		return auth, nil
+	}
+	return parseSigV4QueryAuthorization(r.URL.Query())
 }
 
 func parseSigV4Authorization(header string) (sigV4Authorization, error) {
@@ -166,6 +209,51 @@ func parseSigV4Authorization(header string) (sigV4Authorization, error) {
 	}, nil
 }
 
+func parseSigV4QueryAuthorization(values url.Values) (sigV4Authorization, error) {
+	if values.Get("X-Amz-Algorithm") != "AWS4-HMAC-SHA256" {
+		return sigV4Authorization{}, fmt.Errorf("invalid authorization scheme")
+	}
+
+	credential := values.Get("X-Amz-Credential")
+	xAmzDate := values.Get("X-Amz-Date")
+	expiresValue := values.Get("X-Amz-Expires")
+	signedHeadersValue := values.Get("X-Amz-SignedHeaders")
+	signature := values.Get("X-Amz-Signature")
+	if credential == "" || xAmzDate == "" || expiresValue == "" || signedHeadersValue == "" || signature == "" {
+		return sigV4Authorization{}, fmt.Errorf("missing authorization fields")
+	}
+
+	credentialParts := strings.Split(credential, "/")
+	if len(credentialParts) != 5 || credentialParts[4] != "aws4_request" {
+		return sigV4Authorization{}, fmt.Errorf("invalid credential scope")
+	}
+
+	expiresSeconds, err := time.ParseDuration(expiresValue + "s")
+	if err != nil {
+		return sigV4Authorization{}, fmt.Errorf("invalid expires")
+	}
+	if expiresSeconds <= 0 || expiresSeconds > 7*24*time.Hour {
+		return sigV4Authorization{}, fmt.Errorf("invalid expires")
+	}
+
+	signedHeaders := strings.Split(signedHeadersValue, ";")
+	if len(signedHeaders) == 0 || signedHeaders[0] == "" {
+		return sigV4Authorization{}, fmt.Errorf("missing signed headers")
+	}
+
+	return sigV4Authorization{
+		accessKey:     credentialParts[0],
+		date:          credentialParts[1],
+		region:        credentialParts[2],
+		service:       credentialParts[3],
+		signedHeaders: signedHeaders,
+		signature:     strings.ToLower(signature),
+		xAmzDate:      xAmzDate,
+		expires:       expiresSeconds,
+		presigned:     true,
+	}, nil
+}
+
 func payloadHash(r *http.Request) (string, error) {
 	hash := r.Header.Get("X-Amz-Content-Sha256")
 	if hash == "" {
@@ -198,7 +286,7 @@ func payloadHash(r *http.Request) (string, error) {
 	return strings.ToLower(hash), nil
 }
 
-func buildCanonicalRequest(r *http.Request, signedHeaders []string, payloadHash string) (string, error) {
+func buildCanonicalRequest(r *http.Request, signedHeaders []string, payloadHash string, excludeSignatureQuery bool) (string, error) {
 	canonicalHeaders, signedHeaderList, err := canonicalHeaders(r, signedHeaders)
 	if err != nil {
 		return "", err
@@ -207,7 +295,7 @@ func buildCanonicalRequest(r *http.Request, signedHeaders []string, payloadHash 
 	return strings.Join([]string{
 		r.Method,
 		canonicalURI(r.URL),
-		canonicalQueryString(r.URL),
+		canonicalQueryString(r.URL, excludeSignatureQuery),
 		canonicalHeaders,
 		signedHeaderList,
 		payloadHash,
@@ -231,7 +319,7 @@ func canonicalURI(u *url.URL) string {
 	return result
 }
 
-func canonicalQueryString(u *url.URL) string {
+func canonicalQueryString(u *url.URL, excludeSignature bool) string {
 	if u.RawQuery == "" {
 		return ""
 	}
@@ -247,6 +335,9 @@ func canonicalQueryString(u *url.URL) string {
 		key, value, hasValue := strings.Cut(token, "=")
 		if !hasValue {
 			value = ""
+		}
+		if excludeSignature && canonicalQueryComponent(key) == "X-Amz-Signature" {
+			continue
 		}
 		pairs = append(pairs, pair{
 			key:   canonicalQueryComponent(key),

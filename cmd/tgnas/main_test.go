@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +16,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+
+	"github.com/aahl/tgnas/config"
+	"github.com/aahl/tgnas/internal/s3api"
 	"github.com/aahl/tgnas/metadata"
 	"github.com/aahl/tgnas/store"
 	"github.com/aahl/tgnas/telegram"
@@ -175,6 +182,22 @@ func TestRunMainDAVSubcommand(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("runServiceFunc was not called")
+	}
+}
+
+func TestPublicReadBucketsFromConfig(t *testing.T) {
+	cfg := config.Config{Buckets: map[string]config.BucketConfig{
+		"photos":  {ChatID: "-100", PublicRead: true},
+		"backups": {ChatID: "-200"},
+		"media":   {ChatID: "-300", PublicRead: true},
+	}}
+
+	publicReadBuckets := publicReadBucketsFromConfig(cfg)
+	if !publicReadBuckets["photos"] || !publicReadBuckets["media"] {
+		t.Fatalf("publicReadBuckets = %#v, want photos and media", publicReadBuckets)
+	}
+	if publicReadBuckets["backups"] {
+		t.Fatalf("publicReadBuckets = %#v, backups should not be public", publicReadBuckets)
 	}
 }
 
@@ -920,5 +943,420 @@ func seedObject(t *testing.T, meta metadata.Store, bucket, key string) {
 	chunk := metadata.Chunk{Bucket: bucket, Key: key, PartNumber: 1, Offset: 0, Size: object.Size, TelegramType: "document", TelegramFileID: key + "-file", TelegramMessageID: 1, TelegramFileUniqueID: key + "-unique", SHA256: object.SHA256}
 	if err := meta.PutObject(context.Background(), object, []metadata.Chunk{chunk}); err != nil {
 		t.Fatalf("PutObject(%s) returned error: %v", key, err)
+	}
+}
+
+func TestTrustedProxyMiddlewareTrustsForwardedHostWhenRemoteIPMatches(t *testing.T) {
+	handler, err := newTrustedProxyMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "external.example.com" {
+			t.Fatalf("Host = %q", r.Host)
+		}
+		if r.URL.Host != "external.example.com" {
+			t.Fatalf("URL.Host = %q", r.URL.Host)
+		}
+		if r.URL.Scheme != "https" {
+			t.Fatalf("URL.Scheme = %q", r.URL.Scheme)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}), config.ServerConfig{TrustedProxies: []string{"127.0.0.1/32"}})
+	if err != nil {
+		t.Fatalf("newTrustedProxyMiddleware returned error: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9000/", nil)
+	request.RemoteAddr = "127.0.0.1:54321"
+	request.Header.Set("X-Forwarded-Host", "external.example.com")
+	request.Header.Set("X-Forwarded-Proto", "https")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+}
+
+func TestTrustedProxyMiddlewareTrustsForwardedProtoWhenRemoteIPMatches(t *testing.T) {
+	handler, err := newTrustedProxyMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "127.0.0.1:9000" {
+			t.Fatalf("Host = %q", r.Host)
+		}
+		if r.URL.Host != "127.0.0.1:9000" {
+			t.Fatalf("URL.Host = %q", r.URL.Host)
+		}
+		if r.URL.Scheme != "https" {
+			t.Fatalf("URL.Scheme = %q", r.URL.Scheme)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}), config.ServerConfig{TrustedProxies: []string{"127.0.0.1/32"}})
+	if err != nil {
+		t.Fatalf("newTrustedProxyMiddleware returned error: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9000/", nil)
+	request.RemoteAddr = "127.0.0.1:54321"
+	request.Header.Set("X-Forwarded-Proto", "https")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+}
+
+func TestTrustedProxyMiddlewareClonesBeforeRewritingRequest(t *testing.T) {
+	handler, err := newTrustedProxyMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "external.example.com" {
+			t.Fatalf("Host = %q", r.Host)
+		}
+		if r.URL.Host != "external.example.com" {
+			t.Fatalf("URL.Host = %q", r.URL.Host)
+		}
+		if r.URL.Scheme != "https" {
+			t.Fatalf("URL.Scheme = %q", r.URL.Scheme)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}), config.ServerConfig{TrustedProxies: []string{"127.0.0.1/32"}})
+	if err != nil {
+		t.Fatalf("newTrustedProxyMiddleware returned error: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://internal.example:9000/", nil)
+	request.Host = "internal.example:9000"
+	request.URL.Host = "internal.example:9000"
+	request.URL.Scheme = "http"
+	request.RemoteAddr = "127.0.0.1:54321"
+	request.Header.Set("X-Forwarded-Host", "external.example.com")
+	request.Header.Set("X-Forwarded-Proto", "https")
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+	if request.Host != "internal.example:9000" {
+		t.Fatalf("original Host = %q", request.Host)
+	}
+	if request.URL.Host != "internal.example:9000" {
+		t.Fatalf("original URL.Host = %q", request.URL.Host)
+	}
+	if request.URL.Scheme != "http" {
+		t.Fatalf("original URL.Scheme = %q", request.URL.Scheme)
+	}
+}
+
+func TestTrustedProxyMiddlewareAcceptsAnyForwardedHostWhenRemoteIPMatches(t *testing.T) {
+	handler, err := newTrustedProxyMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "tenant.example.net" {
+			t.Fatalf("Host = %q", r.Host)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}), config.ServerConfig{TrustedProxies: []string{"10.0.0.0/8"}, TrustedProxyHosts: []string{"s3.example.com"}})
+	if err != nil {
+		t.Fatalf("newTrustedProxyMiddleware returned error: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://10.1.2.3:9000/", nil)
+	request.RemoteAddr = "10.1.2.3:54321"
+	request.Header.Set("X-Forwarded-Host", "tenant.example.net")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+}
+
+func TestTrustedProxyMiddlewareTrustsForwardedHostWhenHostMatches(t *testing.T) {
+	handler, err := newTrustedProxyMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "s3.example.com" {
+			t.Fatalf("Host = %q", r.Host)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}), config.ServerConfig{TrustedProxyHosts: []string{"s3.example.com"}})
+	if err != nil {
+		t.Fatalf("newTrustedProxyMiddleware returned error: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9000/", nil)
+	request.RemoteAddr = "203.0.113.10:54321"
+	request.Header.Set("X-Forwarded-Host", "S3.EXAMPLE.COM")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+}
+
+func TestTrustedProxyMiddlewareLeavesRequestUnchangedWithoutTrustMatch(t *testing.T) {
+	handler, err := newTrustedProxyMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "127.0.0.1:9000" {
+			t.Fatalf("Host = %q", r.Host)
+		}
+		if r.URL.Host != "127.0.0.1:9000" {
+			t.Fatalf("URL.Host = %q", r.URL.Host)
+		}
+		if r.URL.Scheme != "http" {
+			t.Fatalf("URL.Scheme = %q", r.URL.Scheme)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}), config.ServerConfig{TrustedProxies: []string{"10.0.0.0/8"}, TrustedProxyHosts: []string{"s3.example.com"}})
+	if err != nil {
+		t.Fatalf("newTrustedProxyMiddleware returned error: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9000/", nil)
+	request.RemoteAddr = "203.0.113.10:54321"
+	request.Header.Set("X-Forwarded-Host", "evil.example.com")
+	request.Header.Set("X-Forwarded-Proto", "https")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+}
+
+func TestTrustedProxyMiddlewareReturnsOriginalHandlerWithoutTrustedSettings(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "127.0.0.1:9000" {
+			t.Fatalf("Host = %q", r.Host)
+		}
+		if r.URL.Scheme != "http" {
+			t.Fatalf("URL.Scheme = %q", r.URL.Scheme)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	handler, err := newTrustedProxyMiddleware(inner, config.ServerConfig{})
+	if err != nil {
+		t.Fatalf("newTrustedProxyMiddleware returned error: %v", err)
+	}
+	if fmt.Sprintf("%p", handler) != fmt.Sprintf("%p", inner) {
+		t.Fatalf("handler = %p, want original %p", handler, inner)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9000/", nil)
+	request.RemoteAddr = "127.0.0.1:54321"
+	request.Header.Set("X-Forwarded-Host", "s3.example.com")
+	request.Header.Set("X-Forwarded-Proto", "https")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+}
+
+func TestTrustedProxyMiddlewareTrustsIPv6RemoteAddr(t *testing.T) {
+	handler, err := newTrustedProxyMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "ipv6.example.com" {
+			t.Fatalf("Host = %q", r.Host)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}), config.ServerConfig{TrustedProxies: []string{"2001:db8::/32"}})
+	if err != nil {
+		t.Fatalf("newTrustedProxyMiddleware returned error: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://[2001:db8::1]:9000/", nil)
+	request.RemoteAddr = "[2001:db8::1]:54321"
+	request.Header.Set("X-Forwarded-Host", "ipv6.example.com")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+}
+
+func TestTrustedProxyMiddlewarePrefersXForwardedHeaders(t *testing.T) {
+	handler, err := newTrustedProxyMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "x-forwarded.example.com" {
+			t.Fatalf("Host = %q", r.Host)
+		}
+		if r.URL.Scheme != "https" {
+			t.Fatalf("URL.Scheme = %q", r.URL.Scheme)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}), config.ServerConfig{TrustedProxies: []string{"127.0.0.1/32"}})
+	if err != nil {
+		t.Fatalf("newTrustedProxyMiddleware returned error: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9000/", nil)
+	request.RemoteAddr = "127.0.0.1:54321"
+	request.Header.Set("X-Forwarded-Host", "x-forwarded.example.com")
+	request.Header.Set("X-Forwarded-Proto", "https")
+	request.Header.Set("Forwarded", `proto=http;host="forwarded.example.com"`)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+}
+
+func TestTrustedProxyMiddlewareReadsForwardedHeaderFallback(t *testing.T) {
+	handler, err := newTrustedProxyMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "s3.example.com" {
+			t.Fatalf("Host = %q", r.Host)
+		}
+		if r.URL.Scheme != "https" {
+			t.Fatalf("URL.Scheme = %q", r.URL.Scheme)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}), config.ServerConfig{TrustedProxyHosts: []string{"s3.example.com"}})
+	if err != nil {
+		t.Fatalf("newTrustedProxyMiddleware returned error: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9000/", nil)
+	request.RemoteAddr = "203.0.113.10:54321"
+	request.Header.Set("Forwarded", `for=203.0.113.9;proto=https;host="s3.example.com"`)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+}
+
+func TestTrustedProxyMiddlewareUsesFirstForwardedHostValue(t *testing.T) {
+	handler, err := newTrustedProxyMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "first.example.com" {
+			t.Fatalf("Host = %q", r.Host)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}), config.ServerConfig{TrustedProxies: []string{"127.0.0.1/32"}})
+	if err != nil {
+		t.Fatalf("newTrustedProxyMiddleware returned error: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9000/", nil)
+	request.RemoteAddr = "127.0.0.1:54321"
+	request.Header.Set("X-Forwarded-Host", "first.example.com, second.example.com")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+}
+
+func TestTrustedProxyMiddlewareAllowsSigV4SignedForForwardedHost(t *testing.T) {
+	s3Handler := s3api.NewServer(proxySigV4ObjectStore{}, s3api.Options{
+		Region:      "us-east-1",
+		Credentials: map[string]string{"AKID": "SECRET"},
+		SigV4Clock:  func() time.Time { return time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC) },
+		Ready:       func() bool { return true },
+	})
+	handler, err := newTrustedProxyMiddleware(s3Handler, config.ServerConfig{TrustedProxies: []string{"127.0.0.1/32"}})
+	if err != nil {
+		t.Fatalf("newTrustedProxyMiddleware returned error: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "https://s3.example.com/", nil)
+	signRequestForProxyTest(t, request)
+	request.URL.Scheme = "http"
+	request.URL.Host = "127.0.0.1:9000"
+	request.Host = "127.0.0.1:9000"
+	request.RemoteAddr = "127.0.0.1:54321"
+	request.Header.Set("X-Forwarded-Host", "s3.example.com")
+	request.Header.Set("X-Forwarded-Proto", "https")
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestTrustedProxyMiddlewareAllowsPresignedURLSignedForForwardedHost(t *testing.T) {
+	s3Handler := s3api.NewServer(proxySigV4ObjectStore{}, s3api.Options{
+		Region:      "us-east-1",
+		Credentials: map[string]string{"AKID": "SECRET"},
+		SigV4Clock:  func() time.Time { return time.Date(2024, 1, 2, 3, 5, 0, 0, time.UTC) },
+		Ready:       func() bool { return true },
+	})
+	handler, err := newTrustedProxyMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "s3.example.com" {
+			t.Fatalf("Host = %q", r.Host)
+		}
+		if r.URL.Host != "s3.example.com" {
+			t.Fatalf("URL.Host = %q", r.URL.Host)
+		}
+		if r.URL.Scheme != "https" {
+			t.Fatalf("URL.Scheme = %q", r.URL.Scheme)
+		}
+		s3Handler.ServeHTTP(w, r)
+	}), config.ServerConfig{TrustedProxies: []string{"127.0.0.1/32"}})
+	if err != nil {
+		t.Fatalf("newTrustedProxyMiddleware returned error: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodHead, "https://s3.example.com/tgnas/test.txt", nil)
+	request.Host = "s3.example.com"
+	query := request.URL.Query()
+	query.Set("X-Amz-Expires", strconv.FormatInt(int64((15*time.Minute)/time.Second), 10))
+	request.URL.RawQuery = query.Encode()
+
+	credentials := aws.Credentials{AccessKeyID: "AKID", SecretAccessKey: "SECRET"}
+	signedURL, _, err := v4.NewSigner().PresignHTTP(context.Background(), credentials, request, "UNSIGNED-PAYLOAD", "s3", "us-east-1", time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC), func(options *v4.SignerOptions) {
+		options.DisableURIPathEscaping = true
+	})
+	if err != nil {
+		t.Fatalf("PresignHTTP returned error: %v", err)
+	}
+
+	presigned := httptest.NewRequest(http.MethodHead, signedURL, nil)
+	presigned.URL.Scheme = "http"
+	presigned.URL.Host = "127.0.0.1:9000"
+	presigned.Host = "127.0.0.1:9000"
+	presigned.RemoteAddr = "127.0.0.1:54321"
+	presigned.Header.Set("X-Forwarded-Host", "s3.example.com")
+	presigned.Header.Set("X-Forwarded-Proto", "https")
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, presigned)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+type proxySigV4ObjectStore struct{}
+
+func (proxySigV4ObjectStore) ListBuckets(context.Context) ([]metadata.Bucket, error) {
+	return []metadata.Bucket{{Name: "tgnas", CreatedAt: time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC), Enabled: true}}, nil
+}
+
+func (proxySigV4ObjectStore) HeadBucket(context.Context, string) error {
+	return nil
+}
+
+func (proxySigV4ObjectStore) DeleteBucket(context.Context, string) error {
+	return nil
+}
+
+func (proxySigV4ObjectStore) PutObject(context.Context, store.PutObjectInput) (store.PutObjectResult, error) {
+	return store.PutObjectResult{}, nil
+}
+
+func (proxySigV4ObjectStore) GetObject(context.Context, store.GetObjectInput) (io.ReadCloser, store.ObjectInfo, error) {
+	return nil, store.ObjectInfo{}, store.ErrNoSuchKey
+}
+
+func (proxySigV4ObjectStore) HeadObject(context.Context, string, string) (store.ObjectInfo, error) {
+	return store.ObjectInfo{}, store.ErrNoSuchKey
+}
+
+func (proxySigV4ObjectStore) ListObjects(context.Context, store.ListObjectsInput) (store.ListObjectsResult, error) {
+	return store.ListObjectsResult{}, nil
+}
+
+func (proxySigV4ObjectStore) DeleteObject(context.Context, string, string) error {
+	return nil
+}
+
+func signRequestForProxyTest(t *testing.T, request *http.Request) {
+	t.Helper()
+	payloadHash := request.Header.Get("X-Amz-Content-Sha256")
+	if payloadHash == "" {
+		sum := sha256.Sum256(nil)
+		payloadHash = hex.EncodeToString(sum[:])
+		request.Header.Set("X-Amz-Content-Sha256", payloadHash)
+	}
+	credentials := aws.Credentials{AccessKeyID: "AKID", SecretAccessKey: "SECRET"}
+	if err := v4.NewSigner().SignHTTP(context.Background(), credentials, request, payloadHash, "s3", "us-east-1", time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)); err != nil {
+		t.Fatalf("SignHTTP returned error: %v", err)
 	}
 }

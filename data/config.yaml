@@ -4,6 +4,16 @@ server:
   # listen_env: "TGNAS_LISTEN"
   # Public URL used when the service needs to describe its external endpoint.
   # public_base_url: "https://s3.example.com"
+  # Trusted reverse proxy CIDRs (forwarded host/proto accepted when remote IP matches).
+  # Prefer this when possible: any forwarded host from a trusted proxy IP is accepted.
+  # trusted_proxies:
+  #   - "127.0.0.1/32"
+  #   - "172.16.0.0/12"
+  # Hostnames that are always trusted for forwarded headers (case-insensitive).
+  # Warning: this trusts the forwarded host value itself, which is client-controlled
+  # unless a real proxy strips and sets it, so block direct untrusted access.
+  # trusted_proxy_hosts:
+  #   - "s3.example.com"
 
 auth:
   # region: "us-east-1"
@@ -44,5 +54,6 @@ webdav:
 buckets:
   tgnas:
     chat_id: "${TGNAS_TELEGRAM_CHAT_ID}"
+    # public_read: false
   # private:
   #   chat_id: "-1001234567890"
