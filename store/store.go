@@ -505,7 +505,18 @@ func multipartETag(parts []multipartPart) string {
 }
 
 func (s *ObjectStore) AbortMultipartUpload(ctx context.Context, input AbortMultipartUploadInput) error {
-	return ErrNotImplemented
+	if input.UploadID == "" {
+		return ErrInvalidArgument
+	}
+	s.multipartMu.Lock()
+	defer s.multipartMu.Unlock()
+	upload := s.multipartUploads[input.UploadID]
+	if upload == nil || upload.bucket != input.Bucket || upload.key != input.Key {
+		return ErrNoSuchUpload
+	}
+	s.logMultipartOrphansLocked(input.UploadID, "abort")
+	delete(s.multipartUploads, input.UploadID)
+	return nil
 }
 
 func (s *ObjectStore) HeadObject(ctx context.Context, bucket, key string) (ObjectInfo, error) {

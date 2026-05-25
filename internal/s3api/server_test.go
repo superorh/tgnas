@@ -40,6 +40,29 @@ func TestCreateMultipartUploadReturnsUploadID(t *testing.T) {
 	}
 }
 
+func TestMultipartAbortRemovesUpload(t *testing.T) {
+	server := newSignedTestServer(t)
+
+	create := signedRecorderRequest(t, http.MethodPost, "/photos/big.bin?uploads", "", nil)
+	server.ServeHTTP(create.recorder, create.request)
+	uploadID := extractBetween(create.recorder.Body.String(), "<UploadId>", "</UploadId>")
+	if create.recorder.Code != http.StatusOK || uploadID == "" {
+		t.Fatalf("create status = %d body = %s", create.recorder.Code, create.recorder.Body.String())
+	}
+
+	abort := signedRecorderRequest(t, http.MethodDelete, "/photos/big.bin?uploadId="+url.QueryEscape(uploadID), "", nil)
+	server.ServeHTTP(abort.recorder, abort.request)
+	if abort.recorder.Code != http.StatusNoContent {
+		t.Fatalf("abort status = %d body = %s", abort.recorder.Code, abort.recorder.Body.String())
+	}
+
+	part := signedRecorderRequest(t, http.MethodPut, "/photos/big.bin?partNumber=1&uploadId="+url.QueryEscape(uploadID), "abc", nil)
+	server.ServeHTTP(part.recorder, part.request)
+	if part.recorder.Code != http.StatusNotFound || !strings.Contains(part.recorder.Body.String(), "NoSuchUpload") {
+		t.Fatalf("part status = %d body = %s", part.recorder.Code, part.recorder.Body.String())
+	}
+}
+
 func TestMultipartCompleteMakesObjectReadable(t *testing.T) {
 	server := newSignedTestServer(t)
 

@@ -454,7 +454,16 @@ func (s *Server) completeMultipartUpload(w http.ResponseWriter, r *http.Request,
 }
 
 func (s *Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	WriteErrorResponse(w, r, ErrNotImplemented, r.URL.Path, "")
+	uploadID := r.URL.Query().Get("uploadId")
+	if uploadID == "" {
+		WriteErrorResponse(w, r, ErrInvalidArgument, r.URL.Path, "")
+		return
+	}
+	if err := s.store.AbortMultipartUpload(r.Context(), store.AbortMultipartUploadInput{Bucket: bucket, Key: key, UploadID: uploadID}); err != nil {
+		WriteErrorResponse(w, r, MapError(err), r.URL.Path, "")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key string) {

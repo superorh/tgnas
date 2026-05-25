@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"path/filepath"
@@ -699,6 +700,43 @@ func TestSanitizeLogErrorKeepsGenericSecretDiagnostics(t *testing.T) {
 	message := sanitizeLogError(errors.New("write failed: secret cache missing during retry"))
 	if message != "write failed: secret cache missing during retry" {
 		t.Fatalf("sanitizeLogError = %q", message)
+	}
+}
+
+func TestStoreAbortMultipartUploadRemovesSession(t *testing.T) {
+	ctx := context.Background()
+	objectStore, _ := newReadyTestObjectStore(t, map[string]string{"photos": "-100"})
+	created, err := objectStore.CreateMultipartUpload(ctx, CreateMultipartUploadInput{Bucket: "photos", Key: "big.bin", ContentType: "application/octet-stream"})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload returned error: %v", err)
+	}
+	if err := objectStore.AbortMultipartUpload(ctx, AbortMultipartUploadInput{Bucket: "photos", Key: "big.bin", UploadID: created.UploadID}); err != nil {
+		t.Fatalf("AbortMultipartUpload returned error: %v", err)
+	}
+	_, err = objectStore.UploadPart(ctx, UploadPartInput{Bucket: "photos", Key: "big.bin", UploadID: created.UploadID, PartNumber: 1, Size: 3, Body: strings.NewReader("abc")})
+	if err != ErrNoSuchUpload {
+		t.Fatalf("UploadPart err = %v, want ErrNoSuchUpload", err)
+	}
+}
+
+func TestStoreCreateMultipartUploadEvictsOldestSession(t *testing.T) {
+	ctx := context.Background()
+	objectStore, _ := newReadyTestObjectStore(t, map[string]string{"photos": "-100"})
+
+	var first string
+	for i := 0; i < maxMultipartUploads+1; i++ {
+		created, err := objectStore.CreateMultipartUpload(ctx, CreateMultipartUploadInput{Bucket: "photos", Key: fmt.Sprintf("object-%d.bin", i), ContentType: "application/octet-stream"})
+		if err != nil {
+			t.Fatalf("CreateMultipartUpload(%d) returned error: %v", i, err)
+		}
+		if i == 0 {
+			first = created.UploadID
+		}
+	}
+
+	_, err := objectStore.UploadPart(ctx, UploadPartInput{Bucket: "photos", Key: "object-0.bin", UploadID: first, PartNumber: 1, Size: 3, Body: strings.NewReader("abc")})
+	if err != ErrNoSuchUpload {
+		t.Fatalf("UploadPart err = %v, want ErrNoSuchUpload", err)
 	}
 }
 
