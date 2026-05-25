@@ -13,7 +13,7 @@ type noLockSystem struct {
 	next atomic.Uint64
 }
 
-func (noLockSystem) Confirm(now time.Time, name0, name1 string, conditions ...webdav.Condition) (func(), error) {
+func (*noLockSystem) Confirm(now time.Time, name0, name1 string, conditions ...webdav.Condition) (func(), error) {
 	return func() {}, nil
 }
 
@@ -21,11 +21,11 @@ func (ls *noLockSystem) Create(now time.Time, details webdav.LockDetails) (strin
 	return fmt.Sprintf("opaquelocktoken:tgnas-%d", ls.next.Add(1)), nil
 }
 
-func (noLockSystem) Refresh(now time.Time, token string, duration time.Duration) (webdav.LockDetails, error) {
+func (*noLockSystem) Refresh(now time.Time, token string, duration time.Duration) (webdav.LockDetails, error) {
 	return webdav.LockDetails{}, webdav.ErrNoSuchLock
 }
 
-func (noLockSystem) Unlock(now time.Time, token string) error {
+func (*noLockSystem) Unlock(now time.Time, token string) error {
 	return nil
 }
 
