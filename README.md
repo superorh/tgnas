@@ -74,6 +74,7 @@ Run it with the default Docker-oriented config in `data/config.yaml`:
 
 ```bash
 mkdir -p data
+wget -P data https://github.com/aahl/tgnas/raw/refs/heads/dev/data/config.yaml
 
 docker run --rm -u root -v "$PWD/data:/app/data" ghcr.io/aahl/tgnas chown -R app:app /app/data
 
@@ -102,6 +103,8 @@ TGNAS_TELEGRAM_BOT_TOKEN="123456:telegram-bot-token"
 EOF
 
 docker compose run --rm -u root tgnas chown -R app:app /app/data
+wget -P data https://github.com/aahl/tgnas/raw/refs/heads/dev/data/config.yaml
+
 docker compose up -d
 ```
 
