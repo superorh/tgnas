@@ -619,6 +619,41 @@ func TestInvalidContinuationToken(t *testing.T) {
 	}
 }
 
+func TestAuthFailureLogsRequestContext(t *testing.T) {
+	var logs strings.Builder
+	server := NewServer(errorPutObjectStore{}, Options{
+		Region:      "us-east-1",
+		Credentials: map[string]string{"AKID": "SECRET"},
+		SigV4Clock:  func() time.Time { return time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC) },
+		Ready:       func() bool { return true },
+		Logger:      log.New(&logs, "", 0),
+	})
+
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9000/", nil)
+	signRequest(t, request, "AKID", "WRONG")
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	got := logs.String()
+	for _, want := range []string{
+		`event=s3_auth_failure`,
+		`method="GET"`,
+		`path="/"`,
+		`host="127.0.0.1:9000"`,
+		`scheme="http"`,
+		`authorization=true`,
+		`sigv4_query=false`,
+		`error="signature does not match"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("log %q does not contain %s", got, want)
+		}
+	}
+}
+
 func TestAuthErrorsAreS3XML(t *testing.T) {
 	server := newSignedTestServer(t)
 

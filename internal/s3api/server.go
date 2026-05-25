@@ -113,6 +113,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !s.allowsAnonymousPublicRead(r) {
 		identity, err := s.verify.Verify(r)
 		if err != nil {
+			s.logger.Printf("debug event=s3_auth_failure method=%q path=%q raw_query=%q host=%q scheme=%q authorization=%t sigv4_query=%t error=%q", r.Method, r.URL.Path, r.URL.RawQuery, r.Host, r.URL.Scheme, r.Header.Get("Authorization") != "", hasSigV4QueryAuth(r), sanitizeLogError(err))
 			WriteErrorResponse(w, r, MapError(err), r.URL.Path, "")
 			return
 		}

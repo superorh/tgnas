@@ -455,8 +455,9 @@ func publicReadBucketsFromConfig(cfg config.Config) map[string]bool {
 }
 
 type trustedProxyMiddleware struct {
-	next  http.Handler
-	trust trustedProxyTrust
+	next   http.Handler
+	trust  trustedProxyTrust
+	logger *log.Logger
 }
 
 type trustedProxyTrust struct {
@@ -465,6 +466,10 @@ type trustedProxyTrust struct {
 }
 
 func newTrustedProxyMiddleware(next http.Handler, server config.ServerConfig) (http.Handler, error) {
+	return newTrustedProxyMiddlewareWithLogger(next, server, nil)
+}
+
+func newTrustedProxyMiddlewareWithLogger(next http.Handler, server config.ServerConfig, logger *log.Logger) (http.Handler, error) {
 	trust, err := newTrustedProxyTrust(server)
 	if err != nil {
 		return nil, err
@@ -472,7 +477,10 @@ func newTrustedProxyMiddleware(next http.Handler, server config.ServerConfig) (h
 	if len(trust.proxies) == 0 && len(trust.hosts) == 0 {
 		return next, nil
 	}
-	return trustedProxyMiddleware{next: next, trust: trust}, nil
+	if logger == nil {
+		logger = log.New(io.Discard, "", 0)
+	}
+	return trustedProxyMiddleware{next: next, trust: trust, logger: logger}, nil
 }
 
 func newTrustedProxyTrust(server config.ServerConfig) (trustedProxyTrust, error) {
@@ -500,12 +508,16 @@ func (m trustedProxyMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request
 		m.next.ServeHTTP(w, r)
 		return
 	}
-	if !m.trust.trusts(r, forwardedHost) {
-		m.next.ServeHTTP(w, r)
+	trusted := m.trust.trusts(r, forwardedHost)
+	originalHost := r.Host
+	originalScheme := r.URL.Scheme
+	clone := r.Clone(r.Context())
+	if !trusted {
+		m.logger.Printf("debug event=trusted_proxy remote_addr=%q original_host=%q original_scheme=%q forwarded_host=%q forwarded_proto=%q trusted=false", r.RemoteAddr, originalHost, originalScheme, forwardedHost, forwardedProto)
+		m.next.ServeHTTP(w, clone)
 		return
 	}
 
-	clone := r.Clone(r.Context())
 	if forwardedHost != "" {
 		normalized := normalizeForwardedHost(forwardedHost)
 		clone.Host = normalized
@@ -514,6 +526,7 @@ func (m trustedProxyMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request
 	if forwardedProto != "" {
 		clone.URL.Scheme = strings.ToLower(forwardedProto)
 	}
+	m.logger.Printf("debug event=trusted_proxy remote_addr=%q original_host=%q original_scheme=%q forwarded_host=%q forwarded_proto=%q trusted=true rewritten_host=%q rewritten_scheme=%q", r.RemoteAddr, originalHost, originalScheme, forwardedHost, forwardedProto, clone.Host, clone.URL.Scheme)
 	m.next.ServeHTTP(w, clone)
 }
 
@@ -721,7 +734,7 @@ func runServiceWithDebug(configPath string, mode serverMode, dbg debugLogger) er
 		}
 	}
 
-	handler, err = newTrustedProxyMiddleware(handler, cfg.Server)
+	handler, err = newTrustedProxyMiddlewareWithLogger(handler, cfg.Server, dbg.StdLogger())
 	if err != nil {
 		return fmt.Errorf("configure trusted proxy middleware: %w", err)
 	}

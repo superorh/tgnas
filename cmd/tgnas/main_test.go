@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -943,6 +944,42 @@ func seedObject(t *testing.T, meta metadata.Store, bucket, key string) {
 	chunk := metadata.Chunk{Bucket: bucket, Key: key, PartNumber: 1, Offset: 0, Size: object.Size, TelegramType: "document", TelegramFileID: key + "-file", TelegramMessageID: 1, TelegramFileUniqueID: key + "-unique", SHA256: object.SHA256}
 	if err := meta.PutObject(context.Background(), object, []metadata.Chunk{chunk}); err != nil {
 		t.Fatalf("PutObject(%s) returned error: %v", key, err)
+	}
+}
+
+func TestTrustedProxyMiddlewareLogsTrustDecision(t *testing.T) {
+	var logs strings.Builder
+	handler, err := newTrustedProxyMiddlewareWithLogger(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}), config.ServerConfig{TrustedProxies: []string{"127.0.0.1/32"}}, log.New(&logs, "", 0))
+	if err != nil {
+		t.Fatalf("newTrustedProxyMiddlewareWithLogger returned error: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9000/", nil)
+	request.RemoteAddr = "127.0.0.1:54321"
+	request.Header.Set("X-Forwarded-Host", "s3.example.com")
+	request.Header.Set("X-Forwarded-Proto", "https")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+
+	got := logs.String()
+	for _, want := range []string{
+		`event=trusted_proxy`,
+		`remote_addr="127.0.0.1:54321"`,
+		`original_host="127.0.0.1:9000"`,
+		`forwarded_host="s3.example.com"`,
+		`forwarded_proto="https"`,
+		`trusted=true`,
+		`rewritten_host="s3.example.com"`,
+		`rewritten_scheme="https"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("log %q does not contain %s", got, want)
+		}
 	}
 }
 
