@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -57,6 +58,36 @@ func TestVerifySigV4RejectsSignatureMismatch(t *testing.T) {
 	}
 }
 
+func TestVerifySigV4LogsSignatureMismatchDiagnostics(t *testing.T) {
+	var logs strings.Builder
+	request := signedTestRequest(t, signedRequestOptions{accessKey: "AKID", secret: "WRONG", region: "us-east-1", service: "s3", target: "https://s3.example.com/?x-id=ListBuckets"})
+	verifier := NewSigV4Verifier("us-east-1", map[string]string{"AKID": "SECRET"}, WithSigV4Clock(func() time.Time { return time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC) }), WithSigV4Logger(log.New(&logs, "", 0)))
+
+	_, err := verifier.Verify(request)
+	if err != ErrSignatureDoesNotMatch {
+		t.Fatalf("err = %v, want ErrSignatureDoesNotMatch", err)
+	}
+
+	got := logs.String()
+	for _, want := range []string{
+		`event=sigv4_verify_failure`,
+		`stage="signature"`,
+		`method="GET"`,
+		`path="/"`,
+		`raw_query="x-id=ListBuckets"`,
+		`host="s3.example.com"`,
+		`access_key="AKID"`,
+		`scope="20240102/us-east-1/s3/aws4_request"`,
+		`signed_headers="host;x-amz-content-sha256;x-amz-date"`,
+		`payload_hash="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"`,
+		`canonical_request_hash=`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("log %q does not contain %s", got, want)
+		}
+	}
+}
+
 func TestVerifySigV4RejectsWrongRegionOrService(t *testing.T) {
 	for _, request := range []*http.Request{
 		signedTestRequest(t, signedRequestOptions{accessKey: "AKID", secret: "SECRET", region: "eu-west-1", service: "s3"}),
@@ -72,6 +103,18 @@ func TestVerifySigV4RejectsWrongRegionOrService(t *testing.T) {
 
 func TestVerifySigV4SignedByAWSSDK(t *testing.T) {
 	request := signedTestRequest(t, signedRequestOptions{accessKey: "AKID", secret: "SECRET", region: "us-east-1", service: "s3"})
+	verifier := NewSigV4Verifier("us-east-1", map[string]string{"AKID": "SECRET"}, WithSigV4Clock(func() time.Time { return time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC) }))
+	identity, err := verifier.Verify(request)
+	if err != nil {
+		t.Fatalf("Verify returned error: %v", err)
+	}
+	if identity.AccessKey != "AKID" {
+		t.Fatalf("identity = %+v", identity)
+	}
+}
+
+func TestVerifySigV4ListBucketsSignedByAWSSDK(t *testing.T) {
+	request := signedTestRequest(t, signedRequestOptions{accessKey: "AKID", secret: "SECRET", region: "us-east-1", service: "s3", target: "https://s3.example.com/?x-id=ListBuckets"})
 	verifier := NewSigV4Verifier("us-east-1", map[string]string{"AKID": "SECRET"}, WithSigV4Clock(func() time.Time { return time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC) }))
 	identity, err := verifier.Verify(request)
 	if err != nil {
@@ -347,6 +390,7 @@ type signedRequestOptions struct {
 	region    string
 	service   string
 	method    string
+	target    string
 	rawQuery  string
 	body      []byte
 }
@@ -409,9 +453,12 @@ func signedTestRequest(t *testing.T, opts signedRequestOptions) *http.Request {
 		method = http.MethodGet
 	}
 
-	url := "https://example.com/photos/hello.txt"
-	if opts.rawQuery != "" {
-		url += "?" + opts.rawQuery
+	url := opts.target
+	if url == "" {
+		url = "https://example.com/photos/hello.txt"
+		if opts.rawQuery != "" {
+			url += "?" + opts.rawQuery
+		}
 	}
 
 	var body io.Reader

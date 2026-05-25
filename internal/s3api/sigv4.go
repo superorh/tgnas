@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -27,6 +28,7 @@ type SigV4Verifier struct {
 	keys    map[string]string
 	clock   func() time.Time
 	maxSkew time.Duration
+	logger  *log.Logger
 }
 
 type SigV4VerifierOption func(*SigV4Verifier)
@@ -40,6 +42,12 @@ func WithSigV4Clock(clock func() time.Time) SigV4VerifierOption {
 func WithSigV4MaxSkew(maxSkew time.Duration) SigV4VerifierOption {
 	return func(v *SigV4Verifier) {
 		v.maxSkew = maxSkew
+	}
+}
+
+func WithSigV4Logger(logger *log.Logger) SigV4VerifierOption {
+	return func(v *SigV4Verifier) {
+		v.logger = logger
 	}
 }
 
@@ -68,11 +76,17 @@ func NewSigV4Verifier(region string, keys map[string]string, opts ...SigV4Verifi
 }
 
 func (v *SigV4Verifier) Verify(r *http.Request) (Identity, error) {
+	logger := v.logger
+	if logger == nil {
+		logger = log.New(io.Discard, "", 0)
+	}
 	auth, err := parseSigV4RequestAuth(r)
 	if err != nil {
+		logger.Printf("debug event=sigv4_verify_failure stage=%q method=%q path=%q raw_query=%q host=%q scheme=%q error=%q", "parse", r.Method, r.URL.Path, r.URL.RawQuery, r.Host, r.URL.Scheme, sanitizeLogError(err))
 		return Identity{}, ErrSignatureDoesNotMatch
 	}
 	if auth.region != v.region || auth.service != "s3" {
+		logger.Printf("debug event=sigv4_verify_failure stage=%q method=%q path=%q raw_query=%q host=%q scheme=%q access_key=%q request_region=%q request_service=%q scope=%q signed_headers=%q error=%q", "scope", r.Method, r.URL.Path, r.URL.RawQuery, r.Host, r.URL.Scheme, auth.accessKey, auth.region, auth.service, auth.date+"/"+v.region+"/s3/aws4_request", strings.Join(auth.signedHeaders, ";"), "region or service mismatch")
 		return Identity{}, ErrSignatureDoesNotMatch
 	}
 	if auth.accessKey == "" {
@@ -85,13 +99,16 @@ func (v *SigV4Verifier) Verify(r *http.Request) (Identity, error) {
 	}
 
 	if auth.xAmzDate == "" {
+		logger.Printf("debug event=sigv4_verify_failure stage=%q method=%q path=%q raw_query=%q host=%q scheme=%q access_key=%q scope=%q signed_headers=%q error=%q", "time", r.Method, r.URL.Path, r.URL.RawQuery, r.Host, r.URL.Scheme, auth.accessKey, auth.date+"/"+auth.region+"/"+auth.service+"/aws4_request", strings.Join(auth.signedHeaders, ";"), "missing x-amz-date")
 		return Identity{}, ErrSignatureDoesNotMatch
 	}
 	if auth.presigned {
 		if err := v.validatePresignedRequestTime(auth.xAmzDate, auth.date, auth.expires); err != nil {
+			logger.Printf("debug event=sigv4_verify_failure stage=%q method=%q path=%q raw_query=%q host=%q scheme=%q access_key=%q x_amz_date=%q scope=%q signed_headers=%q expires=%v error=%q", "time", r.Method, r.URL.Path, r.URL.RawQuery, r.Host, r.URL.Scheme, auth.accessKey, auth.xAmzDate, auth.date+"/"+auth.region+"/"+auth.service+"/aws4_request", strings.Join(auth.signedHeaders, ";"), auth.expires, sanitizeLogError(err))
 			return Identity{}, ErrSignatureDoesNotMatch
 		}
 	} else if err := v.validateRequestTime(auth.xAmzDate, auth.date); err != nil {
+		logger.Printf("debug event=sigv4_verify_failure stage=%q method=%q path=%q raw_query=%q host=%q scheme=%q access_key=%q x_amz_date=%q scope=%q signed_headers=%q error=%q", "time", r.Method, r.URL.Path, r.URL.RawQuery, r.Host, r.URL.Scheme, auth.accessKey, auth.xAmzDate, auth.date+"/"+auth.region+"/"+auth.service+"/aws4_request", strings.Join(auth.signedHeaders, ";"), sanitizeLogError(err))
 		return Identity{}, ErrSignatureDoesNotMatch
 	}
 
@@ -99,26 +116,30 @@ func (v *SigV4Verifier) Verify(r *http.Request) (Identity, error) {
 	if !auth.presigned {
 		canonicalPayloadHash, err = payloadHash(r)
 		if err != nil {
+			logger.Printf("debug event=sigv4_verify_failure stage=%q method=%q path=%q raw_query=%q host=%q scheme=%q access_key=%q x_amz_date=%q scope=%q signed_headers=%q error=%q", "payload", r.Method, r.URL.Path, r.URL.RawQuery, r.Host, r.URL.Scheme, auth.accessKey, auth.xAmzDate, auth.date+"/"+auth.region+"/"+auth.service+"/aws4_request", strings.Join(auth.signedHeaders, ";"), sanitizeLogError(err))
 			return Identity{}, ErrSignatureDoesNotMatch
 		}
 	}
 
 	canonicalRequest, err := buildCanonicalRequest(r, auth.signedHeaders, canonicalPayloadHash, auth.presigned)
 	if err != nil {
+		logger.Printf("debug event=sigv4_verify_failure stage=%q method=%q path=%q raw_query=%q host=%q scheme=%q access_key=%q x_amz_date=%q scope=%q signed_headers=%q payload_hash=%q error=%q", "canonical", r.Method, r.URL.Path, r.URL.RawQuery, r.Host, r.URL.Scheme, auth.accessKey, auth.xAmzDate, auth.date+"/"+auth.region+"/"+auth.service+"/aws4_request", strings.Join(auth.signedHeaders, ";"), canonicalPayloadHash, sanitizeLogError(err))
 		return Identity{}, ErrSignatureDoesNotMatch
 	}
 
 	credentialScope := strings.Join([]string{auth.date, auth.region, auth.service, "aws4_request"}, "/")
+	canonicalRequestHash := hexSHA256(canonicalRequest)
 	stringToSign := strings.Join([]string{
 		"AWS4-HMAC-SHA256",
 		auth.xAmzDate,
 		credentialScope,
-		hexSHA256(canonicalRequest),
+		canonicalRequestHash,
 	}, "\n")
 
 	signingKey := deriveSigningKey(secret, auth.date, auth.region, auth.service)
 	expectedSignature := hex.EncodeToString(hmacSHA256(signingKey, stringToSign))
 	if subtle.ConstantTimeCompare([]byte(expectedSignature), []byte(auth.signature)) != 1 {
+		logger.Printf("debug event=sigv4_verify_failure stage=%q method=%q path=%q raw_query=%q host=%q scheme=%q access_key=%q x_amz_date=%q scope=%q signed_headers=%q payload_hash=%q canonical_request_hash=%q", "signature", r.Method, r.URL.Path, r.URL.RawQuery, r.Host, r.URL.Scheme, auth.accessKey, auth.xAmzDate, credentialScope, strings.Join(auth.signedHeaders, ";"), canonicalPayloadHash, canonicalRequestHash)
 		return Identity{}, ErrSignatureDoesNotMatch
 	}
 

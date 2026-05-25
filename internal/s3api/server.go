@@ -62,6 +62,7 @@ func NewServer(objectStore ObjectStore, options Options) http.Handler {
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
+	verifierOptions = append(verifierOptions, WithSigV4Logger(logger))
 	publicReadBuckets := make(map[string]bool, len(options.PublicReadBuckets))
 	for bucket, publicRead := range options.PublicReadBuckets {
 		if publicRead {
