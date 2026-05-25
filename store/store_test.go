@@ -702,6 +702,33 @@ func TestSanitizeLogErrorKeepsGenericSecretDiagnostics(t *testing.T) {
 	}
 }
 
+func TestStoreCreateMultipartUploadMissingBucket(t *testing.T) {
+	ctx := context.Background()
+	objectStore, _ := newReadyTestObjectStore(t, map[string]string{"photos": "-100"})
+
+	_, err := objectStore.CreateMultipartUpload(ctx, CreateMultipartUploadInput{Bucket: "missing", Key: "big.bin", ContentType: "application/octet-stream"})
+	if err != ErrNoSuchBucket {
+		t.Fatalf("err = %v, want ErrNoSuchBucket", err)
+	}
+}
+
+func TestStoreCreateMultipartUploadReturnsDistinctUploadIDs(t *testing.T) {
+	ctx := context.Background()
+	objectStore, _ := newReadyTestObjectStore(t, map[string]string{"photos": "-100"})
+
+	first, err := objectStore.CreateMultipartUpload(ctx, CreateMultipartUploadInput{Bucket: "photos", Key: "big.bin", ContentType: "application/octet-stream"})
+	if err != nil {
+		t.Fatalf("first CreateMultipartUpload returned error: %v", err)
+	}
+	second, err := objectStore.CreateMultipartUpload(ctx, CreateMultipartUploadInput{Bucket: "photos", Key: "big.bin", ContentType: "application/octet-stream"})
+	if err != nil {
+		t.Fatalf("second CreateMultipartUpload returned error: %v", err)
+	}
+	if first.UploadID == "" || second.UploadID == "" || first.UploadID == second.UploadID {
+		t.Fatalf("upload ids = %q %q", first.UploadID, second.UploadID)
+	}
+}
+
 func TestMultipartAPITypesCompile(t *testing.T) {
 	create := CreateMultipartUploadInput{Bucket: "photos", Key: "big.bin", ContentType: "application/octet-stream"}
 	if create.Bucket != "photos" || create.Key != "big.bin" || create.ContentType == "" {

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/md5"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aahl/tgnas/metadata"
@@ -19,21 +21,50 @@ import (
 )
 
 type ObjectStore struct {
-	meta           metadata.Store
-	tg             telegram.Client
-	options        Options
-	resolver       *UploadStrategyResolver
-	locker         *KeyedLocker
-	uploads        chan struct{}
-	downloads      chan struct{}
-	telegramSem    chan struct{}
-	logger         *log.Logger
-	startupBuckets map[string]metadata.Bucket
+	meta             metadata.Store
+	tg               telegram.Client
+	options          Options
+	resolver         *UploadStrategyResolver
+	locker           *KeyedLocker
+	uploads          chan struct{}
+	downloads        chan struct{}
+	telegramSem      chan struct{}
+	logger           *log.Logger
+	startupBuckets   map[string]metadata.Bucket
+	multipartMu      sync.Mutex
+	multipartUploads map[string]*multipartUpload
 }
 
 type uploadRecord struct {
 	FileID    string
 	MessageID int64
+}
+
+const maxMultipartUploads = 1000
+
+type multipartUpload struct {
+	bucket      string
+	key         string
+	contentType string
+	createdAt   time.Time
+	parts       map[int]multipartPart
+}
+
+type multipartPart struct {
+	number   int
+	etag     string
+	md5Bytes []byte
+	size     int64
+	chunks   []multipartChunk
+}
+
+type multipartChunk struct {
+	size                 int64
+	telegramType         string
+	telegramFileID       string
+	telegramMessageID    int64
+	telegramFileUniqueID string
+	sha256               string
 }
 
 func NewObjectStore(meta metadata.Store, tg telegram.Client, options Options) (*ObjectStore, error) {
@@ -61,13 +92,14 @@ func NewObjectStore(meta metadata.Store, tg telegram.Client, options Options) (*
 	options.Upload = upload
 
 	store := &ObjectStore{
-		meta:           meta,
-		tg:             tg,
-		options:        options,
-		resolver:       NewUploadStrategyResolver(upload),
-		locker:         NewKeyedLocker(),
-		logger:         options.Logger,
-		startupBuckets: map[string]metadata.Bucket{},
+		meta:             meta,
+		tg:               tg,
+		options:          options,
+		resolver:         NewUploadStrategyResolver(upload),
+		locker:           NewKeyedLocker(),
+		logger:           options.Logger,
+		startupBuckets:   map[string]metadata.Bucket{},
+		multipartUploads: map[string]*multipartUpload{},
 	}
 	if store.logger == nil {
 		store.logger = log.New(io.Discard, "", 0)
@@ -165,6 +197,85 @@ func (s *ObjectStore) PutObject(ctx context.Context, input PutObjectInput) (PutO
 		return s.putSingle(ctx, input, strategy)
 	}
 	return s.putChunked(ctx, input, strategy)
+}
+
+func (s *ObjectStore) CreateMultipartUpload(ctx context.Context, input CreateMultipartUploadInput) (CreateMultipartUploadResult, error) {
+	if err := s.HeadBucket(ctx, input.Bucket); err != nil {
+		return CreateMultipartUploadResult{}, err
+	}
+	uploadID, err := newUploadID()
+	if err != nil {
+		return CreateMultipartUploadResult{}, err
+	}
+
+	s.multipartMu.Lock()
+	defer s.multipartMu.Unlock()
+	s.multipartUploads[uploadID] = &multipartUpload{
+		bucket:      input.Bucket,
+		key:         input.Key,
+		contentType: input.ContentType,
+		createdAt:   time.Now().UTC(),
+		parts:       map[int]multipartPart{},
+	}
+	s.evictOldestMultipartUploadLocked()
+	return CreateMultipartUploadResult{UploadID: uploadID}, nil
+}
+
+func newUploadID() (string, error) {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf[:]), nil
+}
+
+func (s *ObjectStore) evictOldestMultipartUploadLocked() {
+	if len(s.multipartUploads) <= maxMultipartUploads {
+		return
+	}
+	oldestID := ""
+	var oldest time.Time
+	for uploadID, upload := range s.multipartUploads {
+		if oldestID == "" || upload.createdAt.Before(oldest) {
+			oldestID = uploadID
+			oldest = upload.createdAt
+		}
+	}
+	if oldestID != "" {
+		s.logMultipartOrphansLocked(oldestID, "evict")
+		delete(s.multipartUploads, oldestID)
+	}
+}
+
+func (s *ObjectStore) logMultipartOrphansLocked(uploadID, reason string) {
+	if s.logger == nil {
+		return
+	}
+	upload := s.multipartUploads[uploadID]
+	if upload == nil {
+		return
+	}
+	records := make([]uploadRecord, 0)
+	for _, part := range upload.parts {
+		for _, chunk := range part.chunks {
+			records = append(records, uploadRecord{FileID: chunk.telegramFileID, MessageID: chunk.telegramMessageID})
+		}
+	}
+	if len(records) > 0 {
+		s.logOrphanUpload(upload.bucket, upload.key, records, fmt.Errorf("multipart upload %s: %s", uploadID, reason))
+	}
+}
+
+func (s *ObjectStore) UploadPart(ctx context.Context, input UploadPartInput) (UploadPartResult, error) {
+	return UploadPartResult{}, ErrNotImplemented
+}
+
+func (s *ObjectStore) CompleteMultipartUpload(ctx context.Context, input CompleteMultipartUploadInput) (CompleteMultipartUploadResult, error) {
+	return CompleteMultipartUploadResult{}, ErrNotImplemented
+}
+
+func (s *ObjectStore) AbortMultipartUpload(ctx context.Context, input AbortMultipartUploadInput) error {
+	return ErrNotImplemented
 }
 
 func (s *ObjectStore) HeadObject(ctx context.Context, bucket, key string) (ObjectInfo, error) {

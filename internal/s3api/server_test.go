@@ -25,6 +25,48 @@ import (
 	"github.com/aahl/tgnas/store"
 )
 
+func TestCreateMultipartUploadReturnsUploadID(t *testing.T) {
+	server := newSignedTestServer(t)
+
+	create := signedRecorderRequest(t, http.MethodPost, "/photos/big.bin?uploads", "", map[string]string{"Content-Type": "application/octet-stream"})
+	server.ServeHTTP(create.recorder, create.request)
+
+	if create.recorder.Code != http.StatusOK {
+		t.Fatalf("create status = %d body = %s", create.recorder.Code, create.recorder.Body.String())
+	}
+	if !strings.Contains(create.recorder.Body.String(), "<InitiateMultipartUploadResult") || !strings.Contains(create.recorder.Body.String(), "<Bucket>photos</Bucket>") || !strings.Contains(create.recorder.Body.String(), "<Key>big.bin</Key>") || !strings.Contains(create.recorder.Body.String(), "<UploadId>") {
+		t.Fatalf("create body = %s", create.recorder.Body.String())
+	}
+}
+
+func TestMultipartXMLTypesCompile(t *testing.T) {
+	created := InitiateMultipartUploadResult{Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/", Bucket: "photos", Key: "big.bin", UploadID: "upload-1"}
+	data, err := xml.Marshal(created)
+	if err != nil {
+		t.Fatalf("Marshal create result returned error: %v", err)
+	}
+	if !strings.Contains(string(data), "InitiateMultipartUploadResult") || !strings.Contains(string(data), "<UploadId>upload-1</UploadId>") {
+		t.Fatalf("create xml = %s", data)
+	}
+
+	var complete CompleteMultipartUploadRequest
+	if err := xml.Unmarshal([]byte(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"abc"</ETag></Part></CompleteMultipartUpload>`), &complete); err != nil {
+		t.Fatalf("Unmarshal complete returned error: %v", err)
+	}
+	if len(complete.Parts) != 1 || complete.Parts[0].PartNumber != 1 || complete.Parts[0].ETag != "\"abc\"" {
+		t.Fatalf("complete request = %+v", complete)
+	}
+
+	completed := CompleteMultipartUploadResult{Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/", Bucket: "photos", Key: "big.bin", ETag: "\"etag-2\""}
+	data, err = xml.Marshal(completed)
+	if err != nil {
+		t.Fatalf("Marshal complete result returned error: %v", err)
+	}
+	if !strings.Contains(string(data), "CompleteMultipartUploadResult") || !strings.Contains(string(data), "<ETag>&#34;etag-2&#34;</ETag>") {
+		t.Fatalf("complete xml = %s", data)
+	}
+}
+
 func TestRootNegotiationDefaultsToS3ListBuckets(t *testing.T) {
 	server := newSignedTestServer(t)
 	recorder := httptest.NewRecorder()
@@ -732,6 +774,22 @@ func (s errorPutObjectStore) ListObjects(context.Context, store.ListObjectsInput
 
 func (s errorPutObjectStore) DeleteObject(context.Context, string, string) error {
 	return nil
+}
+
+func (s errorPutObjectStore) CreateMultipartUpload(context.Context, store.CreateMultipartUploadInput) (store.CreateMultipartUploadResult, error) {
+	return store.CreateMultipartUploadResult{}, store.ErrNotImplemented
+}
+
+func (s errorPutObjectStore) UploadPart(context.Context, store.UploadPartInput) (store.UploadPartResult, error) {
+	return store.UploadPartResult{}, store.ErrNotImplemented
+}
+
+func (s errorPutObjectStore) CompleteMultipartUpload(context.Context, store.CompleteMultipartUploadInput) (store.CompleteMultipartUploadResult, error) {
+	return store.CompleteMultipartUploadResult{}, store.ErrNotImplemented
+}
+
+func (s errorPutObjectStore) AbortMultipartUpload(context.Context, store.AbortMultipartUploadInput) error {
+	return store.ErrNotImplemented
 }
 
 type signedHTTPTest struct {

@@ -26,6 +26,10 @@ type ObjectStore interface {
 	HeadObject(ctx context.Context, bucket, key string) (store.ObjectInfo, error)
 	ListObjects(ctx context.Context, input store.ListObjectsInput) (store.ListObjectsResult, error)
 	DeleteObject(ctx context.Context, bucket, key string) error
+	CreateMultipartUpload(ctx context.Context, input store.CreateMultipartUploadInput) (store.CreateMultipartUploadResult, error)
+	UploadPart(ctx context.Context, input store.UploadPartInput) (store.UploadPartResult, error)
+	CompleteMultipartUpload(ctx context.Context, input store.CompleteMultipartUploadInput) (store.CompleteMultipartUploadResult, error)
+	AbortMultipartUpload(ctx context.Context, input store.AbortMultipartUploadInput) error
 }
 
 type Options struct {
@@ -278,14 +282,33 @@ func (s *Server) handleBucket(w http.ResponseWriter, r *http.Request, bucket str
 }
 
 func (s *Server) handleObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	query := r.URL.Query()
 	switch r.Method {
+	case http.MethodPost:
+		if _, ok := query["uploads"]; ok {
+			s.createMultipartUpload(w, r, bucket, key)
+			return
+		}
+		if query.Get("uploadId") != "" {
+			s.completeMultipartUpload(w, r, bucket, key)
+			return
+		}
+		http.NotFound(w, r)
 	case http.MethodPut:
+		if query.Get("uploadId") != "" || query.Get("partNumber") != "" {
+			s.uploadPart(w, r, bucket, key)
+			return
+		}
 		s.putObject(w, r, bucket, key)
 	case http.MethodGet:
 		s.getObject(w, r, bucket, key)
 	case http.MethodHead:
 		s.headObject(w, r, bucket, key)
 	case http.MethodDelete:
+		if query.Get("uploadId") != "" {
+			s.abortMultipartUpload(w, r, bucket, key)
+			return
+		}
 		if err := s.store.DeleteObject(r.Context(), bucket, key); err != nil {
 			WriteErrorResponse(w, r, MapError(err), r.URL.Path, "")
 			return
@@ -375,6 +398,27 @@ func (s *Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket st
 		response.NextContinuationToken = token
 	}
 	writeXML(w, http.StatusOK, response)
+}
+
+func (s *Server) createMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	result, err := s.store.CreateMultipartUpload(r.Context(), store.CreateMultipartUploadInput{Bucket: bucket, Key: key, ContentType: r.Header.Get("Content-Type")})
+	if err != nil {
+		WriteErrorResponse(w, r, MapError(err), r.URL.Path, "")
+		return
+	}
+	writeXML(w, http.StatusOK, InitiateMultipartUploadResult{Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/", Bucket: bucket, Key: key, UploadID: result.UploadID})
+}
+
+func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	WriteErrorResponse(w, r, ErrNotImplemented, r.URL.Path, "")
+}
+
+func (s *Server) completeMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	WriteErrorResponse(w, r, ErrNotImplemented, r.URL.Path, "")
+}
+
+func (s *Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	WriteErrorResponse(w, r, ErrNotImplemented, r.URL.Path, "")
 }
 
 func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key string) {

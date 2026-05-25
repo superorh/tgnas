@@ -48,3 +48,29 @@ type ListBucketResult struct {
 	Contents              []Contents       `xml:"Contents"`
 	CommonPrefixes        []CommonPrefixes `xml:"CommonPrefixes"`
 }
+
+type InitiateMultipartUploadResult struct {
+	XMLName  xml.Name `xml:"InitiateMultipartUploadResult"`
+	Xmlns    string   `xml:"xmlns,attr,omitempty"`
+	Bucket   string   `xml:"Bucket"`
+	Key      string   `xml:"Key"`
+	UploadID string   `xml:"UploadId"`
+}
+
+type CompleteMultipartUploadRequest struct {
+	XMLName xml.Name          `xml:"CompleteMultipartUpload"`
+	Parts   []CompletePartXML `xml:"Part"`
+}
+
+type CompletePartXML struct {
+	PartNumber int    `xml:"PartNumber"`
+	ETag       string `xml:"ETag"`
+}
+
+type CompleteMultipartUploadResult struct {
+	XMLName xml.Name `xml:"CompleteMultipartUploadResult"`
+	Xmlns   string   `xml:"xmlns,attr,omitempty"`
+	Bucket  string   `xml:"Bucket"`
+	Key     string   `xml:"Key"`
+	ETag    string   `xml:"ETag"`
+}
