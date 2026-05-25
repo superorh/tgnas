@@ -352,12 +352,12 @@ func (s *ObjectStore) uploadMultipartPartChunks(ctx context.Context, input Uploa
 		chunkSHA := sha256.Sum256(partData)
 		totalParts := int((input.Size + chunkSize - 1) / chunkSize)
 		uploaded, err := s.uploadTelegram(ctx, telegram.UploadRequest{
-			Type:      telegram.TypeDocument,
-			ChatID:    s.bucketChatID(input.Bucket),
-			Reader:    strings.NewReader(string(partData)),
-			Filename:  path.Base(input.Key),
-			MIMEType:  contentType,
-			Caption:   s.renderCaption(PutObjectInput{Bucket: input.Bucket, Key: input.Key, ContentType: contentType, Size: input.Size}, partIndex, totalParts),
+			Type:     telegram.TypeDocument,
+			ChatID:   s.bucketChatID(input.Bucket),
+			Reader:   strings.NewReader(string(partData)),
+			Filename: path.Base(input.Key),
+			MIMEType: contentType,
+			Caption:  s.renderCaption(PutObjectInput{Bucket: input.Bucket, Key: input.Key, ContentType: contentType, Size: input.Size}, partIndex, totalParts),
 		})
 		if err != nil {
 			if len(uploads) > 0 {
