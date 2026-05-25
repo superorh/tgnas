@@ -703,6 +703,85 @@ func TestSanitizeLogErrorKeepsGenericSecretDiagnostics(t *testing.T) {
 	}
 }
 
+func TestStoreCompleteMultipartUploadValidatesParts(t *testing.T) {
+	ctx := context.Background()
+	objectStore, _ := newReadyTestObjectStore(t, map[string]string{"photos": "-100"})
+	created, err := objectStore.CreateMultipartUpload(ctx, CreateMultipartUploadInput{Bucket: "photos", Key: "big.bin", ContentType: "application/octet-stream"})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload returned error: %v", err)
+	}
+	part, err := objectStore.UploadPart(ctx, UploadPartInput{Bucket: "photos", Key: "big.bin", UploadID: created.UploadID, PartNumber: 2, Size: 3, Body: strings.NewReader("abc")})
+	if err != nil {
+		t.Fatalf("UploadPart returned error: %v", err)
+	}
+
+	_, err = objectStore.CompleteMultipartUpload(ctx, CompleteMultipartUploadInput{Bucket: "photos", Key: "big.bin", UploadID: created.UploadID, Parts: []CompletedPart{{PartNumber: 2, ETag: part.ETag}, {PartNumber: 1, ETag: part.ETag}}})
+	if err != ErrInvalidPartOrder {
+		t.Fatalf("order err = %v, want ErrInvalidPartOrder", err)
+	}
+
+	_, err = objectStore.CompleteMultipartUpload(ctx, CompleteMultipartUploadInput{Bucket: "photos", Key: "big.bin", UploadID: created.UploadID, Parts: []CompletedPart{{PartNumber: 1, ETag: part.ETag}}})
+	if err != ErrInvalidPart {
+		t.Fatalf("missing err = %v, want ErrInvalidPart", err)
+	}
+
+	_, err = objectStore.CompleteMultipartUpload(ctx, CompleteMultipartUploadInput{Bucket: "photos", Key: "big.bin", UploadID: created.UploadID, Parts: []CompletedPart{{PartNumber: 2, ETag: "bad"}}})
+	if err != ErrInvalidPart {
+		t.Fatalf("etag err = %v, want ErrInvalidPart", err)
+	}
+}
+
+func TestStoreMultipartRangeGetAcrossVariableChunks(t *testing.T) {
+	ctx := context.Background()
+	objectStore, fake := newReadyTestObjectStoreWithUploadConfig(t, map[string]string{"photos": "-100"}, UploadConfig{Strategy: "document", EnableChunking: true, MaxFileSize: 50, ChunkSize: 3, TypeLimits: map[string]int64{"document": 3}, PutBufferSize: 2})
+	created, err := objectStore.CreateMultipartUpload(ctx, CreateMultipartUploadInput{Bucket: "photos", Key: "big.bin", ContentType: "application/octet-stream"})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload returned error: %v", err)
+	}
+	first, _ := objectStore.UploadPart(ctx, UploadPartInput{Bucket: "photos", Key: "big.bin", UploadID: created.UploadID, PartNumber: 1, Size: 5, Body: strings.NewReader("abcde")})
+	second, _ := objectStore.UploadPart(ctx, UploadPartInput{Bucket: "photos", Key: "big.bin", UploadID: created.UploadID, PartNumber: 2, Size: 4, Body: strings.NewReader("fghi")})
+	_, err = objectStore.CompleteMultipartUpload(ctx, CompleteMultipartUploadInput{Bucket: "photos", Key: "big.bin", UploadID: created.UploadID, Parts: []CompletedPart{{PartNumber: 1, ETag: first.ETag}, {PartNumber: 2, ETag: second.ETag}}})
+	if err != nil {
+		t.Fatalf("CompleteMultipartUpload returned error: %v", err)
+	}
+
+	byteRange := ByteRange{Start: 2, End: 6}
+	reader, _, err := objectStore.GetObject(ctx, GetObjectInput{Bucket: "photos", Key: "big.bin", Range: &byteRange})
+	if err != nil {
+		t.Fatalf("GetObject range returned error: %v", err)
+	}
+	defer reader.Close()
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll returned error: %v", err)
+	}
+	if string(data) != "cdefg" {
+		t.Fatalf("range data = %q", string(data))
+	}
+	if len(fake.Downloads) == 0 {
+		t.Fatalf("downloads = %+v", fake.Downloads)
+	}
+}
+
+func TestStorePutObjectStillUsesWholeObjectMD5AndSHA256(t *testing.T) {
+	ctx := context.Background()
+	objectStore, _ := newReadyTestObjectStore(t, map[string]string{"photos": "-100"})
+	result, err := objectStore.PutObject(ctx, PutObjectInput{Bucket: "photos", Key: "hello.txt", ContentType: "text/plain", Size: 5, Body: strings.NewReader("hello")})
+	if err != nil {
+		t.Fatalf("PutObject returned error: %v", err)
+	}
+	if result.ETag != "5d41402abc4b2a76b9719d911017c592" {
+		t.Fatalf("etag = %q", result.ETag)
+	}
+	head, err := objectStore.HeadObject(ctx, "photos", "hello.txt")
+	if err != nil {
+		t.Fatalf("HeadObject returned error: %v", err)
+	}
+	if head.SHA256 != "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" {
+		t.Fatalf("sha256 = %q", head.SHA256)
+	}
+}
+
 func TestStoreAbortMultipartUploadRemovesSession(t *testing.T) {
 	ctx := context.Background()
 	objectStore, _ := newReadyTestObjectStore(t, map[string]string{"photos": "-100"})

@@ -40,6 +40,57 @@ func TestCreateMultipartUploadReturnsUploadID(t *testing.T) {
 	}
 }
 
+func TestMultipartUploadPartDoesNotExposeObjectBeforeComplete(t *testing.T) {
+	server := newSignedTestServer(t)
+
+	create := signedRecorderRequest(t, http.MethodPost, "/photos/pending.bin?uploads", "", nil)
+	server.ServeHTTP(create.recorder, create.request)
+	uploadID := extractBetween(create.recorder.Body.String(), "<UploadId>", "</UploadId>")
+	part := signedRecorderRequest(t, http.MethodPut, "/photos/pending.bin?partNumber=1&uploadId="+url.QueryEscape(uploadID), "abc", nil)
+	server.ServeHTTP(part.recorder, part.request)
+	if part.recorder.Code != http.StatusOK {
+		t.Fatalf("part status = %d body = %s", part.recorder.Code, part.recorder.Body.String())
+	}
+
+	get := signedRecorderRequest(t, http.MethodGet, "/photos/pending.bin", "", nil)
+	server.ServeHTTP(get.recorder, get.request)
+	if get.recorder.Code != http.StatusNotFound || !strings.Contains(get.recorder.Body.String(), "NoSuchKey") {
+		t.Fatalf("get status = %d body = %s", get.recorder.Code, get.recorder.Body.String())
+	}
+}
+
+func TestMultipartCompleteRejectsMissingPart(t *testing.T) {
+	server := newSignedTestServer(t)
+	create := signedRecorderRequest(t, http.MethodPost, "/photos/big.bin?uploads", "", nil)
+	server.ServeHTTP(create.recorder, create.request)
+	uploadID := extractBetween(create.recorder.Body.String(), "<UploadId>", "</UploadId>")
+
+	body := `<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"missing"</ETag></Part></CompleteMultipartUpload>`
+	complete := signedRecorderRequest(t, http.MethodPost, "/photos/big.bin?uploadId="+url.QueryEscape(uploadID), body, nil)
+	server.ServeHTTP(complete.recorder, complete.request)
+	if complete.recorder.Code != http.StatusBadRequest || !strings.Contains(complete.recorder.Body.String(), "InvalidPart") {
+		t.Fatalf("complete status = %d body = %s", complete.recorder.Code, complete.recorder.Body.String())
+	}
+}
+
+func TestMultipartCompleteRejectsInvalidPartOrder(t *testing.T) {
+	server := newSignedTestServer(t)
+	create := signedRecorderRequest(t, http.MethodPost, "/photos/big.bin?uploads", "", nil)
+	server.ServeHTTP(create.recorder, create.request)
+	uploadID := extractBetween(create.recorder.Body.String(), "<UploadId>", "</UploadId>")
+	part1 := signedRecorderRequest(t, http.MethodPut, "/photos/big.bin?partNumber=1&uploadId="+url.QueryEscape(uploadID), "abc", nil)
+	server.ServeHTTP(part1.recorder, part1.request)
+	part2 := signedRecorderRequest(t, http.MethodPut, "/photos/big.bin?partNumber=2&uploadId="+url.QueryEscape(uploadID), "def", nil)
+	server.ServeHTTP(part2.recorder, part2.request)
+
+	body := `<CompleteMultipartUpload><Part><PartNumber>2</PartNumber><ETag>` + part2.recorder.Header().Get("ETag") + `</ETag></Part><Part><PartNumber>1</PartNumber><ETag>` + part1.recorder.Header().Get("ETag") + `</ETag></Part></CompleteMultipartUpload>`
+	complete := signedRecorderRequest(t, http.MethodPost, "/photos/big.bin?uploadId="+url.QueryEscape(uploadID), body, nil)
+	server.ServeHTTP(complete.recorder, complete.request)
+	if complete.recorder.Code != http.StatusBadRequest || !strings.Contains(complete.recorder.Body.String(), "InvalidPartOrder") {
+		t.Fatalf("complete status = %d body = %s", complete.recorder.Code, complete.recorder.Body.String())
+	}
+}
+
 func TestMultipartAbortRemovesUpload(t *testing.T) {
 	server := newSignedTestServer(t)
 
