@@ -1384,6 +1384,22 @@ func (proxySigV4ObjectStore) DeleteObject(context.Context, string, string) error
 	return nil
 }
 
+func (proxySigV4ObjectStore) CreateMultipartUpload(context.Context, store.CreateMultipartUploadInput) (store.CreateMultipartUploadResult, error) {
+	return store.CreateMultipartUploadResult{}, store.ErrNotImplemented
+}
+
+func (proxySigV4ObjectStore) UploadPart(context.Context, store.UploadPartInput) (store.UploadPartResult, error) {
+	return store.UploadPartResult{}, store.ErrNotImplemented
+}
+
+func (proxySigV4ObjectStore) CompleteMultipartUpload(context.Context, store.CompleteMultipartUploadInput) (store.CompleteMultipartUploadResult, error) {
+	return store.CompleteMultipartUploadResult{}, store.ErrNotImplemented
+}
+
+func (proxySigV4ObjectStore) AbortMultipartUpload(context.Context, store.AbortMultipartUploadInput) error {
+	return store.ErrNotImplemented
+}
+
 func signRequestForProxyTest(t *testing.T, request *http.Request) {
 	t.Helper()
 	payloadHash := request.Header.Get("X-Amz-Content-Sha256")
