@@ -139,11 +139,47 @@ func (v *SigV4Verifier) Verify(r *http.Request) (Identity, error) {
 	signingKey := deriveSigningKey(secret, auth.date, auth.region, auth.service)
 	expectedSignature := hex.EncodeToString(hmacSHA256(signingKey, stringToSign))
 	if subtle.ConstantTimeCompare([]byte(expectedSignature), []byte(auth.signature)) != 1 {
+		if acceptsRewrittenAcceptEncoding(r, auth.signedHeaders) {
+			fallbackRequest := cloneRequestWithHeader(r, "Accept-Encoding", "identity")
+			fallbackCanonicalRequest, err := buildCanonicalRequest(fallbackRequest, auth.signedHeaders, canonicalPayloadHash, auth.presigned)
+			if err == nil {
+				fallbackStringToSign := strings.Join([]string{
+					"AWS4-HMAC-SHA256",
+					auth.xAmzDate,
+					credentialScope,
+					hexSHA256(fallbackCanonicalRequest),
+				}, "\n")
+				fallbackSignature := hex.EncodeToString(hmacSHA256(signingKey, fallbackStringToSign))
+				if subtle.ConstantTimeCompare([]byte(fallbackSignature), []byte(auth.signature)) == 1 {
+					logger.Printf("debug event=sigv4_accept_encoding_fallback method=%q path=%q raw_query=%q host=%q scheme=%q access_key=%q", r.Method, r.URL.Path, r.URL.RawQuery, r.Host, r.URL.Scheme, auth.accessKey)
+					return Identity{AccessKey: auth.accessKey, Presigned: auth.presigned}, nil
+				}
+			}
+		}
 		logger.Printf("debug event=sigv4_verify_failure stage=%q method=%q path=%q raw_query=%q host=%q scheme=%q access_key=%q x_amz_date=%q scope=%q signed_headers=%q payload_hash=%q signed_header_value_hashes=%q canonical_request_hash=%q", "signature", r.Method, r.URL.Path, r.URL.RawQuery, r.Host, r.URL.Scheme, auth.accessKey, auth.xAmzDate, credentialScope, strings.Join(auth.signedHeaders, ";"), canonicalPayloadHash, signedHeaderValueHashes(r, auth.signedHeaders), canonicalRequestHash)
 		return Identity{}, ErrSignatureDoesNotMatch
 	}
 
 	return Identity{AccessKey: auth.accessKey, Presigned: auth.presigned}, nil
+}
+
+func acceptsRewrittenAcceptEncoding(r *http.Request, signedHeaders []string) bool {
+	if r.Header.Get("Accept-Encoding") == "" {
+		return false
+	}
+	for _, header := range signedHeaders {
+		if strings.EqualFold(strings.TrimSpace(header), "accept-encoding") {
+			return true
+		}
+	}
+	return false
+}
+
+func cloneRequestWithHeader(r *http.Request, name, value string) *http.Request {
+	clone := r.Clone(r.Context())
+	clone.Header = r.Header.Clone()
+	clone.Header.Set(name, value)
+	return clone
 }
 
 func (v *SigV4Verifier) validateRequestTime(xAmzDate, scopeDate string) error {

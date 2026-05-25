@@ -151,6 +151,31 @@ func TestVerifySigV4ListBucketsWithSignedSDKHeaders(t *testing.T) {
 	}
 }
 
+func TestVerifySigV4AllowsProxyRewrittenAcceptEncoding(t *testing.T) {
+	request := signedTestRequest(t, signedRequestOptions{
+		accessKey: "AKID",
+		secret:    "SECRET",
+		region:    "us-east-1",
+		service:   "s3",
+		target:    "https://s3.example.com/?x-id=ListBuckets",
+		headers: map[string]string{
+			"Accept-Encoding":       "identity",
+			"Amz-Sdk-Invocation-Id": "12345678-1234-1234-1234-123456789abc",
+			"Amz-Sdk-Request":       "attempt=1; max=3",
+		},
+	})
+	request.Header.Set("Accept-Encoding", "gzip, br")
+
+	verifier := NewSigV4Verifier("us-east-1", map[string]string{"AKID": "SECRET"}, WithSigV4Clock(func() time.Time { return time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC) }))
+	identity, err := verifier.Verify(request)
+	if err != nil {
+		t.Fatalf("Verify returned error: %v", err)
+	}
+	if identity.AccessKey != "AKID" {
+		t.Fatalf("identity = %+v", identity)
+	}
+}
+
 func TestVerifySigV4RejectsStaleRequestTime(t *testing.T) {
 	request := signedTestRequest(t, signedRequestOptions{accessKey: "AKID", secret: "SECRET", region: "us-east-1", service: "s3"})
 	verifier := NewSigV4Verifier("us-east-1", map[string]string{"AKID": "SECRET"}, WithSigV4Clock(func() time.Time { return time.Date(2024, 1, 2, 3, 20, 0, 0, time.UTC) }))
