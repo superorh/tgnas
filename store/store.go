@@ -267,7 +267,133 @@ func (s *ObjectStore) logMultipartOrphansLocked(uploadID, reason string) {
 }
 
 func (s *ObjectStore) UploadPart(ctx context.Context, input UploadPartInput) (UploadPartResult, error) {
-	return UploadPartResult{}, ErrNotImplemented
+	if input.PartNumber < 1 || input.UploadID == "" || input.Size < 0 {
+		return UploadPartResult{}, ErrInvalidArgument
+	}
+	if input.Body == nil {
+		input.Body = strings.NewReader("")
+	}
+
+	s.multipartMu.Lock()
+	upload := s.multipartUploads[input.UploadID]
+	if upload == nil || upload.bucket != input.Bucket || upload.key != input.Key {
+		s.multipartMu.Unlock()
+		return UploadPartResult{}, ErrNoSuchUpload
+	}
+	contentType := upload.contentType
+	s.multipartMu.Unlock()
+
+	releaseUpload := s.acquire(ctx, s.uploads)
+	if releaseUpload == nil {
+		return UploadPartResult{}, ctx.Err()
+	}
+	defer releaseUpload()
+
+	chunks, etag, md5Bytes, size, err := s.uploadMultipartPartChunks(ctx, input, contentType)
+	if err != nil {
+		return UploadPartResult{}, err
+	}
+
+	s.multipartMu.Lock()
+	defer s.multipartMu.Unlock()
+	upload = s.multipartUploads[input.UploadID]
+	if upload == nil || upload.bucket != input.Bucket || upload.key != input.Key {
+		return UploadPartResult{}, ErrNoSuchUpload
+	}
+	if old, ok := upload.parts[input.PartNumber]; ok && len(old.chunks) > 0 {
+		s.logMultipartPartOrphans(input.Bucket, input.Key, old, fmt.Errorf("multipart part %d replaced", input.PartNumber))
+	}
+	upload.parts[input.PartNumber] = multipartPart{
+		number:   input.PartNumber,
+		etag:     etag,
+		md5Bytes: md5Bytes,
+		size:     size,
+		chunks:   chunks,
+	}
+	return UploadPartResult{ETag: etag}, nil
+}
+
+func (s *ObjectStore) uploadMultipartPartChunks(ctx context.Context, input UploadPartInput, contentType string) ([]multipartChunk, string, []byte, int64, error) {
+	md5Hash := md5.New()
+	chunkSize := s.options.Upload.ChunkSize
+	if chunkSize <= 0 {
+		chunkSize = DefaultUploadConfig().ChunkSize
+	}
+	limit := s.options.Upload.TypeLimits[telegram.TypeDocument]
+	if limit > 0 && chunkSize > limit {
+		chunkSize = limit
+	}
+	if chunkSize <= 0 {
+		return nil, "", nil, 0, ErrEntityTooLarge
+	}
+
+	chunks := []multipartChunk{}
+	uploads := []uploadRecord{}
+	remaining := input.Size
+	partIndex := 1
+	for remaining > 0 {
+		thisChunkSize := chunkSize
+		if remaining < thisChunkSize {
+			thisChunkSize = remaining
+		}
+		data := make([]byte, thisChunkSize)
+		read, err := io.ReadFull(input.Body, data)
+		if err != nil {
+			if len(uploads) > 0 {
+				s.logOrphanUpload(input.Bucket, input.Key, uploads, err)
+			}
+			return nil, "", nil, 0, err
+		}
+		if int64(read) != thisChunkSize {
+			return nil, "", nil, 0, fmt.Errorf("copied %d bytes, want %d", read, thisChunkSize)
+		}
+		partData := data[:read]
+		_, _ = md5Hash.Write(partData)
+		chunkSHA := sha256.Sum256(partData)
+		totalParts := int((input.Size + chunkSize - 1) / chunkSize)
+		uploaded, err := s.uploadTelegram(ctx, telegram.UploadRequest{
+			Type:      telegram.TypeDocument,
+			ChatID:    s.bucketChatID(input.Bucket),
+			Reader:    strings.NewReader(string(partData)),
+			Filename:  path.Base(input.Key),
+			MIMEType:  contentType,
+			Caption:   s.renderCaption(PutObjectInput{Bucket: input.Bucket, Key: input.Key, ContentType: contentType, Size: input.Size}, partIndex, totalParts),
+		})
+		if err != nil {
+			if len(uploads) > 0 {
+				s.logOrphanUpload(input.Bucket, input.Key, uploads, err)
+			}
+			return nil, "", nil, 0, err
+		}
+		uploads = append(uploads, uploadRecord{FileID: uploaded.FileID, MessageID: uploaded.MessageID})
+		chunks = append(chunks, multipartChunk{
+			size:                 int64(len(partData)),
+			telegramType:         uploaded.Type,
+			telegramFileID:       uploaded.FileID,
+			telegramMessageID:    uploaded.MessageID,
+			telegramFileUniqueID: uploaded.FileUniqueID,
+			sha256:               hex.EncodeToString(chunkSHA[:]),
+		})
+		remaining -= int64(len(partData))
+		partIndex++
+	}
+	if extra, err := io.ReadAll(input.Body); err != nil {
+		return nil, "", nil, 0, err
+	} else if len(extra) > 0 {
+		return nil, "", nil, 0, fmt.Errorf("copied %d bytes, want %d", input.Size+int64(len(extra)), input.Size)
+	}
+	md5Bytes := md5Hash.Sum(nil)
+	return chunks, hex.EncodeToString(md5Bytes), md5Bytes, input.Size, nil
+}
+
+func (s *ObjectStore) logMultipartPartOrphans(bucket, key string, part multipartPart, err error) {
+	records := make([]uploadRecord, 0, len(part.chunks))
+	for _, chunk := range part.chunks {
+		records = append(records, uploadRecord{FileID: chunk.telegramFileID, MessageID: chunk.telegramMessageID})
+	}
+	if len(records) > 0 {
+		s.logOrphanUpload(bucket, key, records, err)
+	}
 }
 
 func (s *ObjectStore) CompleteMultipartUpload(ctx context.Context, input CompleteMultipartUploadInput) (CompleteMultipartUploadResult, error) {

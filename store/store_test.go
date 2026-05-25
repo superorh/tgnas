@@ -702,6 +702,29 @@ func TestSanitizeLogErrorKeepsGenericSecretDiagnostics(t *testing.T) {
 	}
 }
 
+func TestStoreUploadPartSplitsIntoTelegramChunks(t *testing.T) {
+	ctx := context.Background()
+	objectStore, fake := newReadyTestObjectStoreWithUploadConfig(t, map[string]string{"photos": "-100"}, UploadConfig{Strategy: "document", EnableChunking: true, MaxFileSize: 50, ChunkSize: 3, TypeLimits: map[string]int64{"document": 3}, PutBufferSize: 2})
+	created, err := objectStore.CreateMultipartUpload(ctx, CreateMultipartUploadInput{Bucket: "photos", Key: "big.bin", ContentType: "application/octet-stream"})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload returned error: %v", err)
+	}
+
+	result, err := objectStore.UploadPart(ctx, UploadPartInput{Bucket: "photos", Key: "big.bin", UploadID: created.UploadID, PartNumber: 1, Size: 8, Body: strings.NewReader("abcdefgh")})
+	if err != nil {
+		t.Fatalf("UploadPart returned error: %v", err)
+	}
+	if result.ETag != "e8dc4081b13434b45189a720b77b6818" {
+		t.Fatalf("etag = %q", result.ETag)
+	}
+	if len(fake.Uploads) != 3 {
+		t.Fatalf("uploads = %d, want 3", len(fake.Uploads))
+	}
+	if fake.Files["file-1"] != "abc" || fake.Files["file-2"] != "def" || fake.Files["file-3"] != "gh" {
+		t.Fatalf("files = %+v", fake.Files)
+	}
+}
+
 func TestStoreCreateMultipartUploadMissingBucket(t *testing.T) {
 	ctx := context.Background()
 	objectStore, _ := newReadyTestObjectStore(t, map[string]string{"photos": "-100"})

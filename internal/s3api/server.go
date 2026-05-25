@@ -410,7 +410,24 @@ func (s *Server) createMultipartUpload(w http.ResponseWriter, r *http.Request, b
 }
 
 func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	WriteErrorResponse(w, r, ErrNotImplemented, r.URL.Path, "")
+	query := r.URL.Query()
+	uploadID := query.Get("uploadId")
+	partNumber, err := strconv.Atoi(query.Get("partNumber"))
+	if uploadID == "" || err != nil || partNumber < 1 {
+		WriteErrorResponse(w, r, ErrInvalidArgument, r.URL.Path, "")
+		return
+	}
+	if r.ContentLength < 0 {
+		WriteErrorResponse(w, r, ErrMissingContentLength, r.URL.Path, "")
+		return
+	}
+	result, err := s.store.UploadPart(r.Context(), store.UploadPartInput{Bucket: bucket, Key: key, UploadID: uploadID, PartNumber: partNumber, Size: r.ContentLength, Body: r.Body})
+	if err != nil {
+		WriteErrorResponse(w, r, MapError(err), r.URL.Path, "")
+		return
+	}
+	w.Header().Set("ETag", fmt.Sprintf("\"%s\"", result.ETag))
+	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) completeMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string) {

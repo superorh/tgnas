@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -36,6 +37,29 @@ func TestCreateMultipartUploadReturnsUploadID(t *testing.T) {
 	}
 	if !strings.Contains(create.recorder.Body.String(), "<InitiateMultipartUploadResult") || !strings.Contains(create.recorder.Body.String(), "<Bucket>photos</Bucket>") || !strings.Contains(create.recorder.Body.String(), "<Key>big.bin</Key>") || !strings.Contains(create.recorder.Body.String(), "<UploadId>") {
 		t.Fatalf("create body = %s", create.recorder.Body.String())
+	}
+}
+
+func TestMultipartUploadPartReturnsETag(t *testing.T) {
+	server := newSignedTestServer(t)
+
+	create := signedRecorderRequest(t, http.MethodPost, "/photos/big.bin?uploads", "", map[string]string{"Content-Type": "application/octet-stream"})
+	server.ServeHTTP(create.recorder, create.request)
+	if create.recorder.Code != http.StatusOK {
+		t.Fatalf("create status = %d body = %s", create.recorder.Code, create.recorder.Body.String())
+	}
+	uploadID := extractBetween(create.recorder.Body.String(), "<UploadId>", "</UploadId>")
+	if uploadID == "" {
+		t.Fatalf("create body = %s", create.recorder.Body.String())
+	}
+
+	part := signedRecorderRequest(t, http.MethodPut, "/photos/big.bin?partNumber=1&uploadId="+url.QueryEscape(uploadID), "abc", nil)
+	server.ServeHTTP(part.recorder, part.request)
+	if part.recorder.Code != http.StatusOK {
+		t.Fatalf("part status = %d body = %s", part.recorder.Code, part.recorder.Body.String())
+	}
+	if part.recorder.Header().Get("ETag") != "\"900150983cd24fb0d6963f7d28e17f72\"" {
+		t.Fatalf("part headers = %v", part.recorder.Header())
 	}
 }
 
