@@ -319,13 +319,13 @@ func payloadHash(r *http.Request) (string, error) {
 		}
 		return "", fmt.Errorf("missing payload hash")
 	}
+	if hash == "UNSIGNED-PAYLOAD" {
+		return hash, nil
+	}
 	if r.Body == nil || r.Body == http.NoBody {
 		if hash != EmptyPayloadSHA256 {
 			return "", fmt.Errorf("payload hash mismatch")
 		}
-		return hash, nil
-	}
-	if hash == "UNSIGNED-PAYLOAD" {
 		return hash, nil
 	}
 

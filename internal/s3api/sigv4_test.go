@@ -176,6 +176,35 @@ func TestVerifySigV4AllowsProxyRewrittenAcceptEncoding(t *testing.T) {
 	}
 }
 
+func TestVerifySigV4AllowsProxyZeroContentLengthForUnsignedPayload(t *testing.T) {
+	request := signedTestRequest(t, signedRequestOptions{
+		accessKey: "AKID",
+		secret:    "SECRET",
+		region:    "us-east-1",
+		service:   "s3",
+		method:    http.MethodGet,
+		target:    "https://s3.example.com/",
+		payloadHash: "UNSIGNED-PAYLOAD",
+		headers: map[string]string{
+			"Content-Type":          "",
+			"Amz-Sdk-Invocation-Id": "12345678-1234-1234-1234-123456789abc",
+			"Amz-Sdk-Request":       "attempt=1; max=3",
+			"X-Amz-Api-Version":     "2006-03-01",
+		},
+	})
+	request.Header.Set("Content-Length", "0")
+	request.ContentLength = -1
+
+	verifier := NewSigV4Verifier("us-east-1", map[string]string{"AKID": "SECRET"}, WithSigV4Clock(func() time.Time { return time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC) }))
+	identity, err := verifier.Verify(request)
+	if err != nil {
+		t.Fatalf("Verify returned error: %v", err)
+	}
+	if identity.AccessKey != "AKID" {
+		t.Fatalf("identity = %+v", identity)
+	}
+}
+
 func TestVerifySigV4RejectsStaleRequestTime(t *testing.T) {
 	request := signedTestRequest(t, signedRequestOptions{accessKey: "AKID", secret: "SECRET", region: "us-east-1", service: "s3"})
 	verifier := NewSigV4Verifier("us-east-1", map[string]string{"AKID": "SECRET"}, WithSigV4Clock(func() time.Time { return time.Date(2024, 1, 2, 3, 20, 0, 0, time.UTC) }))
@@ -436,15 +465,16 @@ type presignedRequestOptions struct {
 }
 
 type signedRequestOptions struct {
-	accessKey string
-	secret    string
-	region    string
-	service   string
-	method    string
-	target    string
-	rawQuery  string
-	headers   map[string]string
-	body      []byte
+	accessKey   string
+	secret      string
+	region      string
+	service     string
+	method      string
+	target      string
+	rawQuery    string
+	headers     map[string]string
+	payloadHash string
+	body        []byte
 }
 
 func presignedTestRequest(t *testing.T, opts presignedRequestOptions) *http.Request {
@@ -515,9 +545,14 @@ func signedTestRequest(t *testing.T, opts signedRequestOptions) *http.Request {
 
 	var body io.Reader
 	payloadHash := EmptyPayloadSHA256
+	if opts.payloadHash != "" {
+		payloadHash = opts.payloadHash
+	}
 	if len(opts.body) > 0 {
 		body = bytes.NewReader(opts.body)
-		payloadHash = hexSHA256(string(opts.body))
+		if opts.payloadHash == "" {
+			payloadHash = hexSHA256(string(opts.body))
+		}
 	}
 
 	request := httptest.NewRequest(method, url, body)
