@@ -1059,6 +1059,14 @@ func (s listBucketsFailStore) DisableBucketsExcept(ctx context.Context, keepName
 	return errors.New("not implemented")
 }
 
+func (s listBucketsFailStore) CountBucketRenameRows(ctx context.Context, oldName string) (metadata.BucketRename, error) {
+	return metadata.BucketRename{}, errors.New("not implemented")
+}
+
+func (s listBucketsFailStore) RenameBucket(ctx context.Context, oldName, newName string) (metadata.BucketRename, error) {
+	return metadata.BucketRename{}, errors.New("not implemented")
+}
+
 func (s listBucketsFailStore) Close() error {
 	return nil
 }
