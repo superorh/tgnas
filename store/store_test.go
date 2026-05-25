@@ -702,6 +702,50 @@ func TestSanitizeLogErrorKeepsGenericSecretDiagnostics(t *testing.T) {
 	}
 }
 
+func TestStoreCompleteMultipartUploadCommitsChunksAndMultipartETag(t *testing.T) {
+	ctx := context.Background()
+	objectStore, fake := newReadyTestObjectStoreWithUploadConfig(t, map[string]string{"photos": "-100"}, UploadConfig{Strategy: "document", EnableChunking: true, MaxFileSize: 50, ChunkSize: 3, TypeLimits: map[string]int64{"document": 3}, PutBufferSize: 2})
+	created, err := objectStore.CreateMultipartUpload(ctx, CreateMultipartUploadInput{Bucket: "photos", Key: "big.bin", ContentType: "application/octet-stream"})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload returned error: %v", err)
+	}
+	first, err := objectStore.UploadPart(ctx, UploadPartInput{Bucket: "photos", Key: "big.bin", UploadID: created.UploadID, PartNumber: 1, Size: 5, Body: strings.NewReader("abcde")})
+	if err != nil {
+		t.Fatalf("UploadPart first returned error: %v", err)
+	}
+	second, err := objectStore.UploadPart(ctx, UploadPartInput{Bucket: "photos", Key: "big.bin", UploadID: created.UploadID, PartNumber: 2, Size: 4, Body: strings.NewReader("fghi")})
+	if err != nil {
+		t.Fatalf("UploadPart second returned error: %v", err)
+	}
+
+	completed, err := objectStore.CompleteMultipartUpload(ctx, CompleteMultipartUploadInput{Bucket: "photos", Key: "big.bin", UploadID: created.UploadID, Parts: []CompletedPart{{PartNumber: 1, ETag: first.ETag}, {PartNumber: 2, ETag: second.ETag}}})
+	if err != nil {
+		t.Fatalf("CompleteMultipartUpload returned error: %v", err)
+	}
+	if completed.ETag != "1c4bb33d6bb358e9305bd0e3f40b1552-2" {
+		t.Fatalf("complete etag = %q", completed.ETag)
+	}
+
+	reader, info, err := objectStore.GetObject(ctx, GetObjectInput{Bucket: "photos", Key: "big.bin"})
+	if err != nil {
+		t.Fatalf("GetObject returned error: %v", err)
+	}
+	defer reader.Close()
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll returned error: %v", err)
+	}
+	if string(data) != "abcdefghi" {
+		t.Fatalf("data = %q", string(data))
+	}
+	if info.Size != 9 || info.ETag != completed.ETag || info.SHA256 != "" {
+		t.Fatalf("info = %+v", info)
+	}
+	if len(fake.Uploads) != 4 {
+		t.Fatalf("uploads = %d, want 4", len(fake.Uploads))
+	}
+}
+
 func TestStoreUploadPartSplitsIntoTelegramChunks(t *testing.T) {
 	ctx := context.Background()
 	objectStore, fake := newReadyTestObjectStoreWithUploadConfig(t, map[string]string{"photos": "-100"}, UploadConfig{Strategy: "document", EnableChunking: true, MaxFileSize: 50, ChunkSize: 3, TypeLimits: map[string]int64{"document": 3}, PutBufferSize: 2})

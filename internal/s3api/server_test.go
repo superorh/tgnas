@@ -40,6 +40,44 @@ func TestCreateMultipartUploadReturnsUploadID(t *testing.T) {
 	}
 }
 
+func TestMultipartCompleteMakesObjectReadable(t *testing.T) {
+	server := newSignedTestServer(t)
+
+	create := signedRecorderRequest(t, http.MethodPost, "/photos/big.bin?uploads", "", map[string]string{"Content-Type": "application/octet-stream"})
+	server.ServeHTTP(create.recorder, create.request)
+	if create.recorder.Code != http.StatusOK {
+		t.Fatalf("create status = %d body = %s", create.recorder.Code, create.recorder.Body.String())
+	}
+	uploadID := extractBetween(create.recorder.Body.String(), "<UploadId>", "</UploadId>")
+
+	part1 := signedRecorderRequest(t, http.MethodPut, "/photos/big.bin?partNumber=1&uploadId="+url.QueryEscape(uploadID), "abcde", nil)
+	server.ServeHTTP(part1.recorder, part1.request)
+	part2 := signedRecorderRequest(t, http.MethodPut, "/photos/big.bin?partNumber=2&uploadId="+url.QueryEscape(uploadID), "fghi", nil)
+	server.ServeHTTP(part2.recorder, part2.request)
+	if part1.recorder.Code != http.StatusOK || part2.recorder.Code != http.StatusOK {
+		t.Fatalf("part statuses = %d %d", part1.recorder.Code, part2.recorder.Code)
+	}
+
+	body := `<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>` + part1.recorder.Header().Get("ETag") + `</ETag></Part><Part><PartNumber>2</PartNumber><ETag>` + part2.recorder.Header().Get("ETag") + `</ETag></Part></CompleteMultipartUpload>`
+	complete := signedRecorderRequest(t, http.MethodPost, "/photos/big.bin?uploadId="+url.QueryEscape(uploadID), body, nil)
+	server.ServeHTTP(complete.recorder, complete.request)
+	if complete.recorder.Code != http.StatusOK {
+		t.Fatalf("complete status = %d body = %s", complete.recorder.Code, complete.recorder.Body.String())
+	}
+	if !strings.Contains(complete.recorder.Body.String(), "<ETag>&#34;1c4bb33d6bb358e9305bd0e3f40b1552-2&#34;</ETag>") {
+		t.Fatalf("complete body = %s", complete.recorder.Body.String())
+	}
+
+	get := signedRecorderRequest(t, http.MethodGet, "/photos/big.bin", "", nil)
+	server.ServeHTTP(get.recorder, get.request)
+	if get.recorder.Code != http.StatusOK || get.recorder.Body.String() != "abcdefghi" {
+		t.Fatalf("get status = %d body = %q", get.recorder.Code, get.recorder.Body.String())
+	}
+	if get.recorder.Header().Get("ETag") != "\"1c4bb33d6bb358e9305bd0e3f40b1552-2\"" {
+		t.Fatalf("get headers = %v", get.recorder.Header())
+	}
+}
+
 func TestMultipartUploadPartReturnsETag(t *testing.T) {
 	server := newSignedTestServer(t)
 

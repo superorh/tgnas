@@ -431,7 +431,26 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket, key 
 }
 
 func (s *Server) completeMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	WriteErrorResponse(w, r, ErrNotImplemented, r.URL.Path, "")
+	uploadID := r.URL.Query().Get("uploadId")
+	if uploadID == "" {
+		WriteErrorResponse(w, r, ErrInvalidArgument, r.URL.Path, "")
+		return
+	}
+	var request CompleteMultipartUploadRequest
+	if err := xml.NewDecoder(r.Body).Decode(&request); err != nil {
+		WriteErrorResponse(w, r, ErrInvalidArgument, r.URL.Path, "")
+		return
+	}
+	parts := make([]store.CompletedPart, 0, len(request.Parts))
+	for _, part := range request.Parts {
+		parts = append(parts, store.CompletedPart{PartNumber: part.PartNumber, ETag: part.ETag})
+	}
+	result, err := s.store.CompleteMultipartUpload(r.Context(), store.CompleteMultipartUploadInput{Bucket: bucket, Key: key, UploadID: uploadID, Parts: parts})
+	if err != nil {
+		WriteErrorResponse(w, r, MapError(err), r.URL.Path, "")
+		return
+	}
+	writeXML(w, http.StatusOK, CompleteMultipartUploadResult{Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/", Bucket: bucket, Key: key, ETag: fmt.Sprintf("\"%s\"", result.ETag)})
 }
 
 func (s *Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key string) {

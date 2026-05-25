@@ -397,7 +397,111 @@ func (s *ObjectStore) logMultipartPartOrphans(bucket, key string, part multipart
 }
 
 func (s *ObjectStore) CompleteMultipartUpload(ctx context.Context, input CompleteMultipartUploadInput) (CompleteMultipartUploadResult, error) {
-	return CompleteMultipartUploadResult{}, ErrNotImplemented
+	if input.UploadID == "" || len(input.Parts) == 0 {
+		return CompleteMultipartUploadResult{}, ErrInvalidArgument
+	}
+
+	releaseLock := s.locker.Lock(input.Bucket, input.Key)
+	defer releaseLock()
+
+	s.multipartMu.Lock()
+	upload := s.multipartUploads[input.UploadID]
+	if upload == nil || upload.bucket != input.Bucket || upload.key != input.Key {
+		s.multipartMu.Unlock()
+		return CompleteMultipartUploadResult{}, ErrNoSuchUpload
+	}
+	parts, err := upload.completeParts(input.Parts)
+	if err != nil {
+		s.multipartMu.Unlock()
+		return CompleteMultipartUploadResult{}, err
+	}
+	contentType := upload.contentType
+	s.multipartMu.Unlock()
+
+	object, chunks, etag := buildMultipartObject(input.Bucket, input.Key, contentType, parts)
+	if err := s.meta.PutObject(ctx, object, chunks); err != nil {
+		s.logMetadataPutObject(input.Bucket, input.Key, len(chunks), etag, err)
+		return CompleteMultipartUploadResult{}, err
+	}
+	s.logMetadataPutObject(input.Bucket, input.Key, len(chunks), etag, nil)
+
+	s.multipartMu.Lock()
+	delete(s.multipartUploads, input.UploadID)
+	s.multipartMu.Unlock()
+	return CompleteMultipartUploadResult{ETag: etag}, nil
+}
+
+func (u *multipartUpload) completeParts(requested []CompletedPart) ([]multipartPart, error) {
+	parts := make([]multipartPart, 0, len(requested))
+	lastPart := 0
+	for _, requestedPart := range requested {
+		if requestedPart.PartNumber <= lastPart {
+			return nil, ErrInvalidPartOrder
+		}
+		lastPart = requestedPart.PartNumber
+		part, ok := u.parts[requestedPart.PartNumber]
+		if !ok || !etagMatches(part.etag, requestedPart.ETag) {
+			return nil, ErrInvalidPart
+		}
+		parts = append(parts, part)
+	}
+	return parts, nil
+}
+
+func etagMatches(stored, submitted string) bool {
+	return strings.Trim(submitted, "\"") == strings.Trim(stored, "\"")
+}
+
+func buildMultipartObject(bucket, key, contentType string, parts []multipartPart) (metadata.Object, []metadata.Chunk, string) {
+	size := int64(0)
+	chunkCount := 0
+	for _, part := range parts {
+		size += part.size
+		chunkCount += len(part.chunks)
+	}
+	etag := multipartETag(parts)
+	chunks := make([]metadata.Chunk, 0, chunkCount)
+	offset := int64(0)
+	partNumber := 1
+	for _, part := range parts {
+		for _, chunk := range part.chunks {
+			chunks = append(chunks, metadata.Chunk{
+				Bucket:               bucket,
+				Key:                  key,
+				PartNumber:           partNumber,
+				Offset:               offset,
+				Size:                 chunk.size,
+				TelegramType:         chunk.telegramType,
+				TelegramFileID:       chunk.telegramFileID,
+				TelegramMessageID:    chunk.telegramMessageID,
+				TelegramFileUniqueID: chunk.telegramFileUniqueID,
+				SHA256:               chunk.sha256,
+			})
+			offset += chunk.size
+			partNumber++
+		}
+	}
+	object := metadata.Object{
+		Bucket:         bucket,
+		Key:            key,
+		Size:           size,
+		ContentType:    contentType,
+		ETag:           etag,
+		SHA256:         "",
+		LastModified:   time.Now().UTC(),
+		ChunkCount:     len(chunks),
+		TelegramType:   telegram.TypeDocument,
+		UploadStrategy: "multipart",
+	}
+	return object, chunks, etag
+}
+
+func multipartETag(parts []multipartPart) string {
+	whole := md5.New()
+	for _, part := range parts {
+		_, _ = whole.Write(part.md5Bytes)
+	}
+	return fmt.Sprintf("%s-%d", hex.EncodeToString(whole.Sum(nil)), len(parts))
 }
 
 func (s *ObjectStore) AbortMultipartUpload(ctx context.Context, input AbortMultipartUploadInput) error {
