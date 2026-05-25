@@ -80,6 +80,9 @@ func TestVerifySigV4LogsSignatureMismatchDiagnostics(t *testing.T) {
 		`scope="20240102/us-east-1/s3/aws4_request"`,
 		`signed_headers="host;x-amz-content-sha256;x-amz-date"`,
 		`payload_hash="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"`,
+		`signed_header_value_hashes="host:`,
+		`x-amz-content-sha256:`,
+		`x-amz-date:`,
 		`canonical_request_hash=`,
 	} {
 		if !strings.Contains(got, want) {
@@ -115,6 +118,29 @@ func TestVerifySigV4SignedByAWSSDK(t *testing.T) {
 
 func TestVerifySigV4ListBucketsSignedByAWSSDK(t *testing.T) {
 	request := signedTestRequest(t, signedRequestOptions{accessKey: "AKID", secret: "SECRET", region: "us-east-1", service: "s3", target: "https://s3.example.com/?x-id=ListBuckets"})
+	verifier := NewSigV4Verifier("us-east-1", map[string]string{"AKID": "SECRET"}, WithSigV4Clock(func() time.Time { return time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC) }))
+	identity, err := verifier.Verify(request)
+	if err != nil {
+		t.Fatalf("Verify returned error: %v", err)
+	}
+	if identity.AccessKey != "AKID" {
+		t.Fatalf("identity = %+v", identity)
+	}
+}
+
+func TestVerifySigV4ListBucketsWithSignedSDKHeaders(t *testing.T) {
+	request := signedTestRequest(t, signedRequestOptions{
+		accessKey: "AKID",
+		secret:    "SECRET",
+		region:    "us-east-1",
+		service:   "s3",
+		target:    "https://s3.example.com/?x-id=ListBuckets",
+		headers: map[string]string{
+			"Accept-Encoding":       "identity",
+			"Amz-Sdk-Invocation-Id": "12345678-1234-1234-1234-123456789abc",
+			"Amz-Sdk-Request":       "attempt=1; max=3",
+		},
+	})
 	verifier := NewSigV4Verifier("us-east-1", map[string]string{"AKID": "SECRET"}, WithSigV4Clock(func() time.Time { return time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC) }))
 	identity, err := verifier.Verify(request)
 	if err != nil {
@@ -392,6 +418,7 @@ type signedRequestOptions struct {
 	method    string
 	target    string
 	rawQuery  string
+	headers   map[string]string
 	body      []byte
 }
 
@@ -469,6 +496,9 @@ func signedTestRequest(t *testing.T, opts signedRequestOptions) *http.Request {
 	}
 
 	request := httptest.NewRequest(method, url, body)
+	for name, value := range opts.headers {
+		request.Header.Set(name, value)
+	}
 	request.Header.Set("X-Amz-Content-Sha256", payloadHash)
 	credentials := aws.Credentials{AccessKeyID: opts.accessKey, SecretAccessKey: opts.secret}
 	err := v4.NewSigner().SignHTTP(context.Background(), credentials, request, payloadHash, opts.service, opts.region, time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC))

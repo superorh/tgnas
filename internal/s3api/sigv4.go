@@ -139,7 +139,7 @@ func (v *SigV4Verifier) Verify(r *http.Request) (Identity, error) {
 	signingKey := deriveSigningKey(secret, auth.date, auth.region, auth.service)
 	expectedSignature := hex.EncodeToString(hmacSHA256(signingKey, stringToSign))
 	if subtle.ConstantTimeCompare([]byte(expectedSignature), []byte(auth.signature)) != 1 {
-		logger.Printf("debug event=sigv4_verify_failure stage=%q method=%q path=%q raw_query=%q host=%q scheme=%q access_key=%q x_amz_date=%q scope=%q signed_headers=%q payload_hash=%q canonical_request_hash=%q", "signature", r.Method, r.URL.Path, r.URL.RawQuery, r.Host, r.URL.Scheme, auth.accessKey, auth.xAmzDate, credentialScope, strings.Join(auth.signedHeaders, ";"), canonicalPayloadHash, canonicalRequestHash)
+		logger.Printf("debug event=sigv4_verify_failure stage=%q method=%q path=%q raw_query=%q host=%q scheme=%q access_key=%q x_amz_date=%q scope=%q signed_headers=%q payload_hash=%q signed_header_value_hashes=%q canonical_request_hash=%q", "signature", r.Method, r.URL.Path, r.URL.RawQuery, r.Host, r.URL.Scheme, auth.accessKey, auth.xAmzDate, credentialScope, strings.Join(auth.signedHeaders, ";"), canonicalPayloadHash, signedHeaderValueHashes(r, auth.signedHeaders), canonicalRequestHash)
 		return Identity{}, ErrSignatureDoesNotMatch
 	}
 
@@ -437,6 +437,34 @@ func canonicalHeaders(r *http.Request, signedHeaders []string) (string, string, 
 	}
 
 	return strings.Join(canonical, "\n") + "\n", strings.Join(normalizedHeaders, ";"), nil
+}
+
+func signedHeaderValueHashes(r *http.Request, signedHeaders []string) string {
+	names := make([]string, 0, len(signedHeaders))
+	seen := make(map[string]struct{}, len(signedHeaders))
+	for _, header := range signedHeaders {
+		name := strings.ToLower(strings.TrimSpace(header))
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		value, ok := headerValue(r, name)
+		if !ok {
+			parts = append(parts, name+":missing")
+			continue
+		}
+		parts = append(parts, name+":"+hexSHA256(normalizeHeaderValue(value)))
+	}
+	return strings.Join(parts, ";")
 }
 
 func headerValue(r *http.Request, name string) (string, bool) {
