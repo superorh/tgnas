@@ -897,7 +897,7 @@ func TestSQLiteCountBucketRenameRowsDoesNotModifyData(t *testing.T) {
 	defer store.Close()
 	ctx := t.Context()
 
-	createdAt := time.Date(2026, 5, 20, 0, 0, 0, 0, time.UTC)
+	createdAt := time.Unix(1779235200, 0)
 	if err := store.UpsertBucket(ctx, Bucket{Name: "old", ChatID: "-100111", CreatedAt: createdAt, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -919,6 +919,103 @@ func TestSQLiteCountBucketRenameRowsDoesNotModifyData(t *testing.T) {
 	}
 	if found.ChatID != "-100111" {
 		t.Fatalf("bucket modified by count: %+v", found)
+	}
+}
+
+func TestSQLiteRenameBucketRenamesBucketObjectsAndChunks(t *testing.T) {
+	store := openTestSQLiteStore(t)
+	defer store.Close()
+	ctx := t.Context()
+
+	createdAt := time.Unix(1779235200, 0)
+	if err := store.UpsertBucket(ctx, Bucket{Name: "old", ChatID: "-100222", CreatedAt: createdAt, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutObject(ctx, Object{Bucket: "old", Key: "doc.txt", Size: 5, ContentType: "text/plain", ETag: "etag2", SHA256: "sha2", LastModified: createdAt, ChunkCount: 1, TelegramType: "document", UploadStrategy: "single"}, []Chunk{{Bucket: "old", Key: "doc.txt", PartNumber: 1, Offset: 0, Size: 5, TelegramType: "document", TelegramFileID: "f2", SHA256: "csha2"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	rename, err := store.RenameBucket(ctx, "old", "new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rename.Buckets != 1 || rename.Objects != 1 || rename.Chunks != 1 {
+		t.Fatalf("unexpected counts: %+v", rename)
+	}
+
+	_, err = store.GetBucket(ctx, "old")
+	if err != ErrNotFound {
+		t.Fatalf("expected old bucket gone, got err=%v", err)
+	}
+
+	bucket, err := store.GetBucket(ctx, "new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bucket.ChatID != "-100222" || bucket.CreatedAt != createdAt {
+		t.Fatalf("bucket metadata not preserved: %+v", bucket)
+	}
+
+	obj, chunks, err := store.GetObject(ctx, "new", "doc.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obj.Bucket != "new" || obj.ETag != "etag2" {
+		t.Fatalf("object not renamed: %+v", obj)
+	}
+	if len(chunks) != 1 || chunks[0].Bucket != "new" || chunks[0].TelegramFileID != "f2" {
+		t.Fatalf("chunks not renamed: %+v", chunks)
+	}
+}
+
+func TestSQLiteRenameBucketRejectsExistingTarget(t *testing.T) {
+	store := openTestSQLiteStore(t)
+	defer store.Close()
+	ctx := t.Context()
+
+	createdAt := time.Unix(1779235200, 0)
+	if err := store.UpsertBucket(ctx, Bucket{Name: "old", ChatID: "-100333", CreatedAt: createdAt, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertBucket(ctx, Bucket{Name: "new", ChatID: "-100444", CreatedAt: createdAt, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := store.RenameBucket(ctx, "old", "new")
+	if err == nil {
+		t.Fatal("expected error renaming to existing bucket")
+	}
+
+	bucket, err := store.GetBucket(ctx, "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bucket.Name != "old" {
+		t.Fatalf("old bucket should be unchanged: %+v", bucket)
+	}
+}
+
+func TestSQLiteRenameBucketPreservesChatID(t *testing.T) {
+	store := openTestSQLiteStore(t)
+	defer store.Close()
+	ctx := t.Context()
+
+	createdAt := time.Unix(1779235200, 0)
+	if err := store.UpsertBucket(ctx, Bucket{Name: "old", ChatID: "-100999", CreatedAt: createdAt, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := store.RenameBucket(ctx, "old", "new")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bucket, err := store.GetBucket(ctx, "new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bucket.ChatID != "-100999" {
+		t.Fatalf("chat_id not preserved: %s", bucket.ChatID)
 	}
 }
 

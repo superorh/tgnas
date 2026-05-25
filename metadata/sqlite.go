@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -473,6 +474,69 @@ func (s *SQLiteStore) DisableBucketsExcept(ctx context.Context, keepNames []stri
 	}
 	_, err := s.db.ExecContext(ctx, query, args...)
 	return err
+}
+
+func (s *SQLiteStore) CountBucketRenameRows(ctx context.Context, oldName string) (BucketRename, error) {
+	var counts BucketRename
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM buckets WHERE name = ?`, oldName).Scan(&counts.Buckets); err != nil {
+		return BucketRename{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM objects WHERE bucket = ?`, oldName).Scan(&counts.Objects); err != nil {
+		return BucketRename{}, err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM object_chunks WHERE bucket = ?`, oldName).Scan(&counts.Chunks); err != nil {
+		return BucketRename{}, err
+	}
+	return counts, nil
+}
+
+func (s *SQLiteStore) RenameBucket(ctx context.Context, oldName, newName string) (BucketRename, error) {
+	if oldName == newName {
+		return BucketRename{}, errors.New("source and destination bucket are the same")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return BucketRename{}, err
+	}
+	defer tx.Rollback()
+
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM buckets WHERE name = ?`, oldName).Scan(&exists); err != nil {
+		return BucketRename{}, err
+	}
+	if exists == 0 {
+		return BucketRename{}, ErrNotFound
+	}
+
+	var targetExists int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM buckets WHERE name = ?`, newName).Scan(&targetExists); err != nil {
+		return BucketRename{}, err
+	}
+	if targetExists > 0 {
+		return BucketRename{}, fmt.Errorf("destination bucket already exists: %s", newName)
+	}
+
+	var counts BucketRename
+	counts.Buckets = 1
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM objects WHERE bucket = ?`, oldName).Scan(&counts.Objects); err != nil {
+		return BucketRename{}, err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM object_chunks WHERE bucket = ?`, oldName).Scan(&counts.Chunks); err != nil {
+		return BucketRename{}, err
+	}
+
+	if _, err := tx.ExecContext(ctx, `UPDATE buckets SET name = ? WHERE name = ?`, newName, oldName); err != nil {
+		return BucketRename{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE objects SET bucket = ? WHERE bucket = ?`, newName, oldName); err != nil {
+		return BucketRename{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE object_chunks SET bucket = ? WHERE bucket = ?`, newName, oldName); err != nil {
+		return BucketRename{}, err
+	}
+
+	return counts, tx.Commit()
 }
 
 func (s *SQLiteStore) migrate() error {
