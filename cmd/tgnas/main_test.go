@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -419,7 +420,7 @@ func TestRunMainGlobalHelpSucceedsAndWritesUsage(t *testing.T) {
 		t.Fatalf("runMain returned error: %v", err)
 	}
 	got := errOut.String()
-	want := "Usage:\n  tgnas [-debug] [-c|-config config.yaml]\n  tgnas [-debug] [-c|-config config.yaml] s3\n  tgnas [-debug] [-c|-config config.yaml] dav\n  tgnas [-debug] [-c|-config config.yaml] ls [-n|-limit N] bucket[/prefix]\n  tgnas [-debug] [-c|-config config.yaml] lsd [bucket[/prefix]]\n"
+	want := "Usage:\n  tgnas [-debug] [-c|-config config.yaml]\n  tgnas [-debug] [-c|-config config.yaml] s3\n  tgnas [-debug] [-c|-config config.yaml] dav\n  tgnas [-debug] [-c|-config config.yaml] ls [-n|-limit N] bucket[/prefix]\n  tgnas [-debug] [-c|-config config.yaml] lsd [bucket[/prefix]]\n  tgnas [-debug] [-c|-config config.yaml] bucket rename [--dry-run] old-bucket new-bucket\n"
 	if got != want {
 		t.Fatalf("help output = %q, want %q", got, want)
 	}
@@ -944,6 +945,318 @@ func seedObject(t *testing.T, meta metadata.Store, bucket, key string) {
 	chunk := metadata.Chunk{Bucket: bucket, Key: key, PartNumber: 1, Offset: 0, Size: object.Size, TelegramType: "document", TelegramFileID: key + "-file", TelegramMessageID: 1, TelegramFileUniqueID: key + "-unique", SHA256: object.SHA256}
 	if err := meta.PutObject(context.Background(), object, []metadata.Chunk{chunk}); err != nil {
 		t.Fatalf("PutObject(%s) returned error: %v", key, err)
+	}
+}
+
+func TestRunMainBucketRenameDryRunDoesNotModifyMetadata(t *testing.T) {
+	t.Setenv("TGNAS_TELEGRAM_BOT_TOKEN", "123456:valid-token")
+	t.Setenv("TGNAS_SECRET_KEY", "secret")
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	dbPath := filepath.Join(dir, "metadata.sqlite")
+
+	cfg := `server:
+  listen: "127.0.0.1:0"
+auth:
+  region: "us-east-1"
+  credentials:
+    - access_key: "admin"
+      secret_key_env: "TGNAS_SECRET_KEY"
+telegram:
+  bot_token_env: "TGNAS_TELEGRAM_BOT_TOKEN"
+metadata:
+  sqlite_path: "` + dbPath + `"
+buckets:
+  new:
+    chat_id: "-100555"
+`
+	if err := os.WriteFile(configPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	meta, err := metadata.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, 5, 20, 0, 0, 0, 0, time.UTC)
+	if err := meta.UpsertBucket(context.Background(), metadata.Bucket{Name: "old", ChatID: "-100555", CreatedAt: createdAt, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := meta.PutObject(context.Background(), metadata.Object{Bucket: "old", Key: "file.txt", Size: 4, ContentType: "text/plain", ETag: "etag3", SHA256: "sha3", LastModified: createdAt, ChunkCount: 1, TelegramType: "document", UploadStrategy: "single"}, []metadata.Chunk{{Bucket: "old", Key: "file.txt", PartNumber: 1, Offset: 0, Size: 4, TelegramType: "document", TelegramFileID: "f3", SHA256: "csha3"}}); err != nil {
+		t.Fatal(err)
+	}
+	meta.Close()
+
+	var stdout, stderr bytes.Buffer
+	if err := runMain([]string{"-c", configPath, "bucket", "rename", "--dry-run", "old", "new"}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "would rename bucket old to new: buckets=1") {
+		t.Fatalf("unexpected stdout: %s", out)
+	}
+
+	meta, err = metadata.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer meta.Close()
+	_, err = meta.GetBucket(context.Background(), "old")
+	if err != nil {
+		t.Fatalf("dry-run should not have removed old bucket: %v", err)
+	}
+}
+
+func TestRunMainBucketRenameRenamesMetadata(t *testing.T) {
+	t.Setenv("TGNAS_TELEGRAM_BOT_TOKEN", "123456:valid-token")
+	t.Setenv("TGNAS_SECRET_KEY", "secret")
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	dbPath := filepath.Join(dir, "metadata.sqlite")
+
+	cfg := `server:
+  listen: "127.0.0.1:0"
+auth:
+  region: "us-east-1"
+  credentials:
+    - access_key: "admin"
+      secret_key_env: "TGNAS_SECRET_KEY"
+telegram:
+  bot_token_env: "TGNAS_TELEGRAM_BOT_TOKEN"
+metadata:
+  sqlite_path: "` + dbPath + `"
+buckets:
+  new:
+    chat_id: "-100666"
+`
+	if err := os.WriteFile(configPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	meta, err := metadata.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, 5, 20, 0, 0, 0, 0, time.UTC)
+	if err := meta.UpsertBucket(context.Background(), metadata.Bucket{Name: "old", ChatID: "-100666", CreatedAt: createdAt, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	meta.Close()
+
+	var stdout, stderr bytes.Buffer
+	if err := runMain([]string{"-c", configPath, "bucket", "rename", "old", "new"}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "renamed bucket old to new: buckets=1") {
+		t.Fatalf("unexpected stdout: %s", out)
+	}
+
+	meta, err = metadata.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer meta.Close()
+	_, err = meta.GetBucket(context.Background(), "old")
+	if err != metadata.ErrNotFound {
+		t.Fatalf("expected old bucket gone after rename: %v", err)
+	}
+	bucket, err := meta.GetBucket(context.Background(), "new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bucket.ChatID != "-100666" {
+		t.Fatalf("chat_id not preserved: %s", bucket.ChatID)
+	}
+}
+
+func TestRunMainBucketRenameRequiresConfiguredTarget(t *testing.T) {
+	t.Setenv("TGNAS_TELEGRAM_BOT_TOKEN", "123456:valid-token")
+	t.Setenv("TGNAS_SECRET_KEY", "secret")
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	dbPath := filepath.Join(dir, "metadata.sqlite")
+
+	cfg := `server:
+  listen: "127.0.0.1:0"
+auth:
+  region: "us-east-1"
+  credentials:
+    - access_key: "admin"
+      secret_key_env: "TGNAS_SECRET_KEY"
+telegram:
+  bot_token_env: "TGNAS_TELEGRAM_BOT_TOKEN"
+metadata:
+  sqlite_path: "` + dbPath + `"
+buckets:
+  old:
+    chat_id: "-100777"
+`
+	if err := os.WriteFile(configPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	meta, err := metadata.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, 5, 20, 0, 0, 0, 0, time.UTC)
+	if err := meta.UpsertBucket(context.Background(), metadata.Bucket{Name: "old", ChatID: "-100777", CreatedAt: createdAt, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	meta.Close()
+
+	var stdout, stderr bytes.Buffer
+	err = runMain([]string{"-c", configPath, "bucket", "rename", "old", "new"}, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("expected error when target bucket not configured")
+	}
+	if !strings.Contains(err.Error(), "target bucket is not configured") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunMainBucketRenameRejectsDifferentTargetChatID(t *testing.T) {
+	t.Setenv("TGNAS_TELEGRAM_BOT_TOKEN", "123456:valid-token")
+	t.Setenv("TGNAS_SECRET_KEY", "secret")
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	dbPath := filepath.Join(dir, "metadata.sqlite")
+
+	cfg := `server:
+  listen: "127.0.0.1:0"
+auth:
+  region: "us-east-1"
+  credentials:
+    - access_key: "admin"
+      secret_key_env: "TGNAS_SECRET_KEY"
+telegram:
+  bot_token_env: "TGNAS_TELEGRAM_BOT_TOKEN"
+metadata:
+  sqlite_path: "` + dbPath + `"
+buckets:
+  new:
+    chat_id: "-100999"
+`
+	if err := os.WriteFile(configPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	meta, err := metadata.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, 5, 20, 0, 0, 0, 0, time.UTC)
+	if err := meta.UpsertBucket(context.Background(), metadata.Bucket{Name: "old", ChatID: "-100888", CreatedAt: createdAt, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	meta.Close()
+
+	var stdout, stderr bytes.Buffer
+	err = runMain([]string{"-c", configPath, "bucket", "rename", "old", "new"}, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("expected error when target chat_id differs from source metadata")
+	}
+	if !strings.Contains(err.Error(), "target bucket chat_id differs") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunMainBucketRenameRejectsExistingTarget(t *testing.T) {
+	t.Setenv("TGNAS_TELEGRAM_BOT_TOKEN", "123456:valid-token")
+	t.Setenv("TGNAS_SECRET_KEY", "secret")
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	dbPath := filepath.Join(dir, "metadata.sqlite")
+
+	cfg := `server:
+  listen: "127.0.0.1:0"
+auth:
+  region: "us-east-1"
+  credentials:
+    - access_key: "admin"
+      secret_key_env: "TGNAS_SECRET_KEY"
+telegram:
+  bot_token_env: "TGNAS_TELEGRAM_BOT_TOKEN"
+metadata:
+  sqlite_path: "` + dbPath + `"
+buckets:
+  new:
+    chat_id: "-100111"
+`
+	if err := os.WriteFile(configPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	meta, err := metadata.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, 5, 20, 0, 0, 0, 0, time.UTC)
+	_ = meta.UpsertBucket(context.Background(), metadata.Bucket{Name: "old", ChatID: "-100111", CreatedAt: createdAt, Enabled: true})
+	_ = meta.UpsertBucket(context.Background(), metadata.Bucket{Name: "new", ChatID: "-100222", CreatedAt: createdAt, Enabled: true})
+	meta.Close()
+
+	var stdout, stderr bytes.Buffer
+	err = runMain([]string{"-c", configPath, "bucket", "rename", "old", "new"}, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("expected error when target bucket already exists in metadata")
+	}
+	if !strings.Contains(err.Error(), "destination bucket already exists") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunMainBucketRenameWarnsWhenSourceStillConfigured(t *testing.T) {
+	t.Setenv("TGNAS_TELEGRAM_BOT_TOKEN", "123456:valid-token")
+	t.Setenv("TGNAS_SECRET_KEY", "secret")
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	dbPath := filepath.Join(dir, "metadata.sqlite")
+
+	cfg := `server:
+  listen: "127.0.0.1:0"
+auth:
+  region: "us-east-1"
+  credentials:
+    - access_key: "admin"
+      secret_key_env: "TGNAS_SECRET_KEY"
+telegram:
+  bot_token_env: "TGNAS_TELEGRAM_BOT_TOKEN"
+metadata:
+  sqlite_path: "` + dbPath + `"
+buckets:
+  old:
+    chat_id: "-100333"
+  new:
+    chat_id: "-100333"
+`
+	if err := os.WriteFile(configPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	meta, err := metadata.OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, 5, 20, 0, 0, 0, 0, time.UTC)
+	if err := meta.UpsertBucket(context.Background(), metadata.Bucket{Name: "old", ChatID: "-100333", CreatedAt: createdAt, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	meta.Close()
+
+	var stdout, stderr bytes.Buffer
+	if err := runMain([]string{"-c", configPath, "bucket", "rename", "old", "new"}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(stderr.String(), "warning: source bucket still exists in config") {
+		t.Fatalf("expected stderr warning, got: %s", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "renamed bucket old to new") {
+		t.Fatalf("expected success output, got: %s", stdout.String())
 	}
 }
 

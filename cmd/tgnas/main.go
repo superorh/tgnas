@@ -51,7 +51,8 @@ const topLevelUsage = "Usage:\n" +
 	"  tgnas [-debug] [-c|-config config.yaml] s3\n" +
 	"  tgnas [-debug] [-c|-config config.yaml] dav\n" +
 	"  tgnas [-debug] [-c|-config config.yaml] ls [-n|-limit N] bucket[/prefix]\n" +
-	"  tgnas [-debug] [-c|-config config.yaml] lsd [bucket[/prefix]]\n"
+	"  tgnas [-debug] [-c|-config config.yaml] lsd [bucket[/prefix]]\n" +
+	"  tgnas [-debug] [-c|-config config.yaml] bucket rename [--dry-run] old-bucket new-bucket\n"
 
 var newObjectStore = store.NewObjectStore
 var listenAndServe = http.ListenAndServe
@@ -124,6 +125,9 @@ func runMain(args []string, stdout, stderr io.Writer) error {
 	case "lsd":
 		dbg.Printf("mode=lsd")
 		return runLSD(configPath, rest[1:], stdout, stderr, dbg)
+	case "bucket":
+		dbg.Printf("mode=bucket")
+		return runBucketCommand(configPath, rest[1:], stdout, stderr, dbg)
 	default:
 		return fmt.Errorf("unknown subcommand: %s", rest[0])
 	}
@@ -320,6 +324,97 @@ func runLSD(configPath string, args []string, stdout, stderr io.Writer, dbg debu
 		return err
 	}
 	return writeCommonPrefixes(ctx, meta, bucket, prefix, stdout, dbg)
+}
+
+func runBucketCommand(configPath string, args []string, stdout, stderr io.Writer, dbg debugLogger) error {
+	if len(args) == 0 {
+		return fmt.Errorf("bucket subcommand is required")
+	}
+	switch args[0] {
+	case "rename":
+		return runRenameBucket(configPath, args[1:], stdout, stderr, dbg)
+	default:
+		return fmt.Errorf("unknown bucket subcommand: %s", args[0])
+	}
+}
+
+func parseRenameBucketFlags(args []string, output io.Writer) (bool, string, string, error) {
+	fs := flag.NewFlagSet("bucket rename", flag.ContinueOnError)
+	if output == nil {
+		output = io.Discard
+	}
+	fs.SetOutput(output)
+	dryRun := fs.Bool("dry-run", false, "print what would change without modifying data")
+	if err := fs.Parse(args); err != nil {
+		return false, "", "", err
+	}
+	rest := fs.Args()
+	if len(rest) != 2 {
+		return false, "", "", fmt.Errorf("usage: bucket rename [--dry-run] old-bucket new-bucket")
+	}
+	return *dryRun, rest[0], rest[1], nil
+}
+
+func runRenameBucket(configPath string, args []string, stdout, stderr io.Writer, dbg debugLogger) error {
+	dryRun, oldName, newName, err := parseRenameBucketFlags(args, stderr)
+	if err != nil {
+		return err
+	}
+
+	cfg, err := config.LoadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+
+	targetBucket, ok := cfg.Buckets[newName]
+	if !ok {
+		return fmt.Errorf("target bucket is not configured: %s", newName)
+	}
+
+	if _, oldStillConfigured := cfg.Buckets[oldName]; oldStillConfigured {
+		fmt.Fprintf(stderr, "warning: source bucket still exists in config: %s\n", oldName)
+	}
+
+	sqlitePath, err := cfg.ResolveSQLitePath()
+	if err != nil {
+		return fmt.Errorf("resolve sqlite path: %w", err)
+	}
+	dbg.Printf("sqlite_path=%q", sqlitePath)
+
+	meta, err := metadata.OpenSQLite(sqlitePath)
+	if err != nil {
+		return fmt.Errorf("open sqlite metadata: %w", err)
+	}
+	defer meta.Close()
+
+	ctx := context.Background()
+	sourceBucket, err := meta.GetBucket(ctx, oldName)
+	if err != nil {
+		if err == metadata.ErrNotFound {
+			return fmt.Errorf("source bucket not found: %s", oldName)
+		}
+		return err
+	}
+
+	if targetBucket.ChatID != sourceBucket.ChatID {
+		return fmt.Errorf("target bucket chat_id differs from source bucket metadata: %s", newName)
+	}
+
+	if dryRun {
+		counts, err := meta.CountBucketRenameRows(ctx, oldName)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "would rename bucket %s to %s: buckets=%d objects=%d chunks=%d\n", oldName, newName, counts.Buckets, counts.Objects, counts.Chunks)
+		return nil
+	}
+
+	counts, err := meta.RenameBucket(ctx, oldName, newName)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "renamed bucket %s to %s: buckets=%d objects=%d chunks=%d\n", oldName, newName, counts.Buckets, counts.Objects, counts.Chunks)
+	return nil
 }
 
 func writeBucketNames(ctx context.Context, meta metadata.Store, stdout io.Writer) error {

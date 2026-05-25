@@ -136,11 +136,14 @@ WebDAV uses HTTP Basic Auth and reuses `auth.credentials`:
 ```text
 tgnas [-debug] [-c|-config config.yaml] ls [-n|-limit N] bucket[/prefix]
 tgnas [-debug] [-c|-config config.yaml] lsd [bucket[/prefix]]
+tgnas [-debug] [-c|-config config.yaml] bucket rename [--dry-run] old-bucket new-bucket
 ```
 
 `ls` prints object keys, one per line. It defaults to 1000 results; `-limit N` and `-n N` set the maximum result count, and `0` means no overall result limit while still reading in pages internally.
 
 `lsd` without a path prints enabled bucket names. `lsd bucket/prefix` prints direct pseudo-directories under the prefix using `/` as the delimiter.
+
+`bucket rename` renames a bucket in the SQLite metadata database. The target bucket name must exist in the current config file with the same `chat_id` as the source bucket metadata. `--dry-run` prints what would change without modifying data. A warning is printed to stderr if the source bucket still appears in the config file.
 
 ## WebDAV behavior
 
