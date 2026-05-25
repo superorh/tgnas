@@ -38,6 +38,9 @@ var (
 	ErrNoSuchKey            = S3Error{Code: "NoSuchKey", Message: "The specified key does not exist.", Status: http.StatusNotFound}
 	ErrInvalidRange         = S3Error{Code: "InvalidRange", Message: "The requested range is not satisfiable.", Status: http.StatusRequestedRangeNotSatisfiable}
 	ErrMissingContentLength = S3Error{Code: "MissingContentLength", Message: "You must provide the Content-Length HTTP header.", Status: http.StatusLengthRequired}
+	ErrNoSuchUpload         = S3Error{Code: "NoSuchUpload", Message: "The specified multipart upload does not exist.", Status: http.StatusNotFound}
+	ErrInvalidPart          = S3Error{Code: "InvalidPart", Message: "One or more of the specified parts could not be found or did not match the supplied ETag.", Status: http.StatusBadRequest}
+	ErrInvalidPartOrder     = S3Error{Code: "InvalidPartOrder", Message: "The list of parts was not in ascending order.", Status: http.StatusBadRequest}
 	ErrInvalidArgument      = S3Error{Code: "InvalidArgument", Message: "Invalid Argument", Status: http.StatusBadRequest}
 	ErrServiceUnavailable   = S3Error{Code: "ServiceUnavailable", Message: "Reduce your request rate.", Status: http.StatusServiceUnavailable}
 	ErrInternalError        = S3Error{Code: "InternalError", Message: "We encountered an internal error. Please try again.", Status: http.StatusInternalServerError}
@@ -88,6 +91,14 @@ func MapError(err error) S3Error {
 		return ErrInvalidRange
 	case errors.Is(err, store.ErrMissingContentLength):
 		return ErrMissingContentLength
+	case errors.Is(err, store.ErrNoSuchUpload):
+		return ErrNoSuchUpload
+	case errors.Is(err, store.ErrInvalidPart):
+		return ErrInvalidPart
+	case errors.Is(err, store.ErrInvalidPartOrder):
+		return ErrInvalidPartOrder
+	case errors.Is(err, store.ErrInvalidArgument):
+		return ErrInvalidArgument
 	case errors.Is(err, ErrInvalidArgumentValue) || err.Error() == "invalid argument":
 		return ErrInvalidArgument
 	case errors.Is(err, ErrServiceUnavailableValue) || err.Error() == "service unavailable":

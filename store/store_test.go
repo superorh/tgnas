@@ -702,6 +702,32 @@ func TestSanitizeLogErrorKeepsGenericSecretDiagnostics(t *testing.T) {
 	}
 }
 
+func TestMultipartAPITypesCompile(t *testing.T) {
+	create := CreateMultipartUploadInput{Bucket: "photos", Key: "big.bin", ContentType: "application/octet-stream"}
+	if create.Bucket != "photos" || create.Key != "big.bin" || create.ContentType == "" {
+		t.Fatalf("create input = %+v", create)
+	}
+
+	upload := UploadPartInput{Bucket: "photos", Key: "big.bin", UploadID: "upload-1", PartNumber: 1, Size: 3, Body: strings.NewReader("abc")}
+	if upload.UploadID == "" || upload.PartNumber != 1 || upload.Size != 3 || upload.Body == nil {
+		t.Fatalf("upload input = %+v", upload)
+	}
+
+	complete := CompleteMultipartUploadInput{Bucket: "photos", Key: "big.bin", UploadID: "upload-1", Parts: []CompletedPart{{PartNumber: 1, ETag: "etag"}}}
+	if len(complete.Parts) != 1 || complete.Parts[0].PartNumber != 1 {
+		t.Fatalf("complete input = %+v", complete)
+	}
+
+	abort := AbortMultipartUploadInput{Bucket: "photos", Key: "big.bin", UploadID: "upload-1"}
+	if abort.UploadID != "upload-1" {
+		t.Fatalf("abort input = %+v", abort)
+	}
+
+	if !errors.Is(ErrNoSuchUpload, ErrNoSuchUpload) || !errors.Is(ErrInvalidPart, ErrInvalidPart) || !errors.Is(ErrInvalidPartOrder, ErrInvalidPartOrder) || !errors.Is(ErrInvalidArgument, ErrInvalidArgument) {
+		t.Fatal("multipart errors must be defined")
+	}
+}
+
 func newReadyTestObjectStore(t *testing.T, buckets map[string]string) (*ObjectStore, *testutil.FakeTelegram) {
 	t.Helper()
 	return newReadyTestObjectStoreWithUploadConfig(t, buckets, DefaultUploadConfig())

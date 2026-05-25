@@ -16,6 +16,10 @@ var (
 	ErrNoSuchKey            = errors.New("no such key")
 	ErrMissingContentLength = errors.New("missing content length")
 	ErrInvalidRange         = errors.New("invalid range")
+	ErrNoSuchUpload         = errors.New("no such upload")
+	ErrInvalidPart          = errors.New("invalid part")
+	ErrInvalidPartOrder     = errors.New("invalid part order")
+	ErrInvalidArgument      = errors.New("invalid argument")
 )
 
 type PutObjectInput struct {
@@ -28,6 +32,51 @@ type PutObjectInput struct {
 
 type PutObjectResult struct {
 	ETag string
+}
+
+type CreateMultipartUploadInput struct {
+	Bucket      string
+	Key         string
+	ContentType string
+}
+
+type CreateMultipartUploadResult struct {
+	UploadID string
+}
+
+type UploadPartInput struct {
+	Bucket     string
+	Key        string
+	UploadID   string
+	PartNumber int
+	Size       int64
+	Body       io.Reader
+}
+
+type UploadPartResult struct {
+	ETag string
+}
+
+type CompletedPart struct {
+	PartNumber int
+	ETag       string
+}
+
+type CompleteMultipartUploadInput struct {
+	Bucket   string
+	Key      string
+	UploadID string
+	Parts    []CompletedPart
+}
+
+type CompleteMultipartUploadResult struct {
+	ETag string
+}
+
+type AbortMultipartUploadInput struct {
+	Bucket   string
+	Key      string
+	UploadID string
 }
 
 type ObjectInfo struct {

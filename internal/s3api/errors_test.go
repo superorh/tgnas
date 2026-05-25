@@ -87,6 +87,27 @@ func TestMapStoreError(t *testing.T) {
 	}
 }
 
+func TestMapMultipartErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		err    error
+		code   string
+		status int
+	}{
+		{name: "no such upload", err: store.ErrNoSuchUpload, code: "NoSuchUpload", status: 404},
+		{name: "invalid part", err: store.ErrInvalidPart, code: "InvalidPart", status: 400},
+		{name: "invalid part order", err: store.ErrInvalidPartOrder, code: "InvalidPartOrder", status: 400},
+		{name: "invalid argument", err: store.ErrInvalidArgument, code: "InvalidArgument", status: 400},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := MapError(tc.err)
+			if got.Code != tc.code || got.Status != tc.status {
+				t.Fatalf("MapError(%v) = %+v", tc.err, got)
+			}
+		})
+	}
+}
+
 func TestMapErrorFallsBackToInternalError(t *testing.T) {
 	got := MapError(errors.New("boom"))
 	if got != ErrInternalError {
