@@ -162,3 +162,7 @@ Bucket `chat_id` values can be literal Telegram chat IDs or full environment-var
 ## Links
 - https://deepwiki.com/aahl/tgnas
 - https://zread.ai/aahl/tgnas
+
+<p align="center">
+  <a href="https://linux.do/"><img alt="Linux.do community" src="https://img.shields.io/badge/Linux.do-community-0ea5e9?style=for-the-badge"></a>
+</p>
