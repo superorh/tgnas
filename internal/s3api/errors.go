@@ -3,7 +3,9 @@ package s3api
 import (
 	"encoding/xml"
 	"errors"
+	"io"
 	"net/http"
+	"strconv"
 
 	"github.com/aahl/tgnas/store"
 )
@@ -59,16 +61,21 @@ func writeError(w http.ResponseWriter, s3err S3Error, resource, requestID string
 		s3err = ErrInternalError
 	}
 	w.Header().Set("Content-Type", "application/xml")
-	w.WriteHeader(s3err.Status)
+	w.Header().Set("Content-Encoding", "identity")
 	if suppressBody {
+		w.WriteHeader(s3err.Status)
 		return
 	}
-	_ = xml.NewEncoder(w).Encode(ErrorResponse{
+	body, _ := xml.Marshal(ErrorResponse{
 		Code:      s3err.Code,
 		Message:   s3err.Message,
 		Resource:  resource,
 		RequestID: requestID,
 	})
+	w.Header().Set("Content-Length", strconv.Itoa(len(xml.Header)+len(body)))
+	w.WriteHeader(s3err.Status)
+	_, _ = io.WriteString(w, xml.Header)
+	_, _ = w.Write(body)
 }
 
 func MapError(err error) S3Error {

@@ -3,6 +3,8 @@ package s3api
 import (
 	"encoding/xml"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -105,6 +107,46 @@ func TestMapMultipartErrors(t *testing.T) {
 				t.Fatalf("MapError(%v) = %+v", tc.err, got)
 			}
 		})
+	}
+}
+
+func TestWriteErrorSetsContentEncodingIdentityAndContentLength(t *testing.T) {
+	recorder := httptest.NewRecorder()
+
+	WriteError(recorder, S3Error{Code: "SignatureDoesNotMatch", Message: "The request signature we calculated does not match the signature you provided.", Status: http.StatusForbidden}, "/bucket/key", "req-456")
+
+	response := recorder.Result()
+	if got := response.Header.Get("Content-Encoding"); got != "identity" {
+		t.Fatalf("content-encoding = %q, want %q", got, "identity")
+	}
+	if got := response.Header.Get("Content-Length"); got == "" {
+		t.Fatal("content-length header is missing")
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if got := response.Header.Get("Content-Length"); got != fmt.Sprintf("%d", len(body)) {
+		t.Fatalf("content-length = %q, but body length = %d", got, len(body))
+	}
+}
+
+func TestWriteErrorResponseSuppressesBodyForHead(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodHead, "/bucket/key", nil)
+
+	WriteErrorResponse(recorder, req, ErrSignatureMismatch, "/bucket/key", "req-789")
+
+	response := recorder.Result()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusForbidden)
+	}
+	if got := response.Header.Get("Content-Encoding"); got != "identity" {
+		t.Fatalf("content-encoding = %q, want %q", got, "identity")
+	}
+	body, _ := io.ReadAll(response.Body)
+	if len(body) != 0 {
+		t.Fatalf("HEAD response should have empty body, got %d bytes", len(body))
 	}
 }
 
