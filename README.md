@@ -1,3 +1,5 @@
+<center><img alt="aahl/tgnas" src="https://github.com/user-attachments/assets/a810a605-a518-4adf-8497-83a2aeb50dc4" /></center>
+
 # TgNAS
 
 `tgnas` is an S3-compatible and WebDAV-capable gateway backed by Telegram storage and local SQLite metadata.
@@ -156,3 +158,7 @@ Supported common operations include `OPTIONS`, `PROPFIND`, `GET`, `HEAD`, `PUT`,
 Buckets are still created from config only. If a bucket remains in metadata after being removed from config, it is treated as an orphan: normal object access is forbidden, but `DELETE /dav/{bucket}` or S3 `DELETE /{bucket}` can clean up the local metadata record and associated object/chunk metadata.
 
 Bucket `chat_id` values can be literal Telegram chat IDs or full environment-variable references such as `chat_id: "${TGNAS_PRIVATE_CHAT_ID}"`. Partial interpolation is not supported. If the referenced environment variable is unset or empty, the resolved `chat_id` is empty and config validation fails.
+
+## Links
+- https://deepwiki.com/aahl/tgnas
+- https://zread.ai/aahl/tgnas
