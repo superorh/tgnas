@@ -872,10 +872,14 @@ func (s *ObjectStore) putSingle(ctx context.Context, input PutObjectInput, strat
 
 	etag := hex.EncodeToString(md5Hash.Sum(nil))
 	shaSum := hex.EncodeToString(shaHash.Sum(nil))
+	storedSize := input.Size
+	if strategy.UploadStrategy == "typed" && uploaded.FileSize > 0 {
+		storedSize = uploaded.FileSize
+	}
 	object := metadata.Object{
 		Bucket:         input.Bucket,
 		Key:            input.Key,
-		Size:           input.Size,
+		Size:           storedSize,
 		ContentType:    input.ContentType,
 		ETag:           etag,
 		SHA256:         shaSum,
@@ -889,7 +893,7 @@ func (s *ObjectStore) putSingle(ctx context.Context, input PutObjectInput, strat
 		Key:                  input.Key,
 		PartNumber:           1,
 		Offset:               0,
-		Size:                 input.Size,
+		Size:                 storedSize,
 		TelegramType:         uploaded.Type,
 		TelegramFileID:       uploaded.FileID,
 		TelegramMessageID:    uploaded.MessageID,

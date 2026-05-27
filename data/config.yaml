@@ -34,6 +34,10 @@ metadata:
 
 storage:
   # upload_type_strategy: "document"
+  # Set to "auto" to use typed Telegram media uploads when possible.
+  # Warning: typed uploads (photo/video/audio/animation) may be recompressed or
+  # otherwise transformed by Telegram. TgNAS stores the Bot API returned file_size
+  # for typed uploads, which may differ from the original uploaded byte size.
   # enable_chunking: true
   # max_file_size: 52428800
   # chunk_size: 20971520

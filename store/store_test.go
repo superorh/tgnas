@@ -312,6 +312,49 @@ func TestStoreLogsOrphanUploadWhenChunkedUploadFailsAfterEarlierChunks(t *testin
 	}
 }
 
+func TestStoreTypedUploadUsesTelegramReturnedFileSize(t *testing.T) {
+	ctx := context.Background()
+	meta, err := metadata.OpenSQLite(filepath.Join(t.TempDir(), "metadata.sqlite"))
+	if err != nil {
+		t.Fatalf("OpenSQLite returned error: %v", err)
+	}
+	defer meta.Close()
+	if err := meta.UpsertBucket(ctx, metadata.Bucket{Name: "photos", ChatID: "-100", CreatedAt: time.Now().UTC(), Enabled: true}); err != nil {
+		t.Fatalf("UpsertBucket returned error: %v", err)
+	}
+
+	fake := testutil.NewFakeTelegram()
+	fake.UploadFunc = func(ctx context.Context, request telegram.UploadRequest) (telegram.UploadedFile, error) {
+		if request.Type != telegram.TypePhoto {
+			return telegram.UploadedFile{}, fmt.Errorf("upload type = %q, want %q", request.Type, telegram.TypePhoto)
+		}
+		data, err := io.ReadAll(request.Reader)
+		if err != nil {
+			return telegram.UploadedFile{}, err
+		}
+		if string(data) != "hello" {
+			return telegram.UploadedFile{}, fmt.Errorf("upload payload = %q, want %q", string(data), "hello")
+		}
+		return telegram.UploadedFile{Type: request.Type, FileID: "photo-file-1", FileUniqueID: "photo-file-1-u", MessageID: 101, FileSize: 3, MIMEType: request.MIMEType}, nil
+	}
+
+	store := mustNewObjectStore(t, meta, fake, Options{Upload: UploadConfig{Strategy: "auto", EnableChunking: true, MaxFileSize: 50, ChunkSize: 3, TypeLimits: map[string]int64{"photo": 10, "document": 50}}})
+	if _, err := store.PutObject(ctx, PutObjectInput{Bucket: "photos", Key: "hello.jpg", ContentType: "image/jpeg", Size: 5, Body: strings.NewReader("hello")}); err != nil {
+		t.Fatalf("PutObject returned error: %v", err)
+	}
+
+	object, err := meta.HeadObject(ctx, "photos", "hello.jpg")
+	if err != nil {
+		t.Fatalf("HeadObject returned error: %v", err)
+	}
+	if object.Size != 3 {
+		t.Fatalf("object size = %d, want %d", object.Size, 3)
+	}
+	if object.UploadStrategy != "typed" || object.TelegramType != telegram.TypePhoto {
+		t.Fatalf("object = %+v", object)
+	}
+}
+
 func TestStoreListObjectsDelimiterPagination(t *testing.T) {
 	ctx := context.Background()
 	objectStore, _ := newReadyTestObjectStore(t, map[string]string{"photos": "-100"})
