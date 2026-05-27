@@ -870,11 +870,19 @@ func (s *ObjectStore) putSingle(ctx context.Context, input PutObjectInput, strat
 	}
 	uploaded := result.uploaded
 
+	storedSize := input.Size
 	etag := hex.EncodeToString(md5Hash.Sum(nil))
 	shaSum := hex.EncodeToString(shaHash.Sum(nil))
-	storedSize := input.Size
 	if strategy.UploadStrategy == "typed" && uploaded.FileSize > 0 {
 		storedSize = uploaded.FileSize
+		// Typed uploads (photo/video/audio/animation) may be recompressed by
+		// Telegram, so the hash of original input bytes doesn't match the actual
+		// downloadable content. Use a random ETag with "-typed" suffix so S3
+		// clients don't attempt MD5 verification (same pattern as multipart ETags).
+		var randBuf [16]byte
+		_, _ = rand.Read(randBuf[:])
+		etag = hex.EncodeToString(randBuf[:]) + "-typed"
+		shaSum = ""
 	}
 	object := metadata.Object{
 		Bucket:         input.Bucket,

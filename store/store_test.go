@@ -3,6 +3,8 @@ package store
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -353,6 +355,51 @@ func TestStoreTypedUploadUsesTelegramReturnedFileSize(t *testing.T) {
 	if object.UploadStrategy != "typed" || object.TelegramType != telegram.TypePhoto {
 		t.Fatalf("object = %+v", object)
 	}
+}
+
+func TestStoreTypedUploadETagNotPlainMD5(t *testing.T) {
+	ctx := context.Background()
+	meta, err := metadata.OpenSQLite(filepath.Join(t.TempDir(), "metadata.sqlite"))
+	if err != nil {
+		t.Fatalf("OpenSQLite returned error: %v", err)
+	}
+	defer meta.Close()
+	if err := meta.UpsertBucket(ctx, metadata.Bucket{Name: "photos", ChatID: "-100", CreatedAt: time.Now().UTC(), Enabled: true}); err != nil {
+		t.Fatalf("UpsertBucket returned error: %v", err)
+	}
+
+	fake := testutil.NewFakeTelegram()
+	fake.UploadFunc = func(ctx context.Context, request telegram.UploadRequest) (telegram.UploadedFile, error) {
+		_, _ = io.ReadAll(request.Reader)
+		return telegram.UploadedFile{Type: request.Type, FileID: "photo-f1", FileUniqueID: "photo-f1-u", MessageID: 201, FileSize: 3}, nil
+	}
+
+	st := mustNewObjectStore(t, meta, fake, Options{Upload: UploadConfig{Strategy: "auto", EnableChunking: true, MaxFileSize: 50, ChunkSize: 3, TypeLimits: map[string]int64{"photo": 10, "document": 50}}})
+	result, err := st.PutObject(ctx, PutObjectInput{Bucket: "photos", Key: "typed.jpg", ContentType: "image/jpeg", Size: 5, Body: strings.NewReader("hello")})
+	if err != nil {
+		t.Fatalf("PutObject returned error: %v", err)
+	}
+
+	if result.ETag == hex.EncodeToString(md5sum([]byte("hello"))) {
+		t.Fatalf("typed upload ETag should not be plain MD5 of input bytes: %s", result.ETag)
+	}
+	if !strings.HasSuffix(result.ETag, "-typed") {
+		t.Fatalf("typed upload ETag should have -typed suffix: %s", result.ETag)
+	}
+
+	object, err := meta.HeadObject(ctx, "photos", "typed.jpg")
+	if err != nil {
+		t.Fatalf("HeadObject returned error: %v", err)
+	}
+	if object.ETag != result.ETag {
+		t.Fatalf("stored ETag %q != returned ETag %q", object.ETag, result.ETag)
+	}
+}
+
+func md5sum(data []byte) []byte {
+	h := md5.New()
+	h.Write(data)
+	return h.Sum(nil)
 }
 
 func TestStoreListObjectsDelimiterPagination(t *testing.T) {
