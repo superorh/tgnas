@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -227,6 +229,33 @@ func TestStoreDeleteObjectMissingKeyReturnsNil(t *testing.T) {
 	store := mustNewObjectStore(t, deleteMissingReturnsNotFoundStore{Store: meta}, testutil.NewFakeTelegram(), Options{Upload: DefaultUploadConfig()})
 	if err := store.DeleteObject(ctx, "photos", "missing"); err != nil {
 		t.Fatalf("DeleteObject returned error: %v", err)
+	}
+}
+
+func TestStoreSingleUploadTempFileRemovedAfterMetadataFailure(t *testing.T) {
+	ctx := context.Background()
+	tempRoot := t.TempDir()
+	t.Setenv("TMPDIR", tempRoot)
+	meta, err := metadata.OpenSQLite(filepath.Join(tempRoot, "metadata.sqlite"))
+	if err != nil {
+		t.Fatalf("OpenSQLite returned error: %v", err)
+	}
+	defer meta.Close()
+	if err := meta.UpsertBucket(ctx, metadata.Bucket{Name: "photos", ChatID: "-100", CreatedAt: time.Now().UTC(), Enabled: true}); err != nil {
+		t.Fatalf("UpsertBucket returned error: %v", err)
+	}
+	fake := testutil.NewFakeTelegram()
+	store := mustNewObjectStore(t, failingMetadataStore{Store: meta, putErr: errors.New("metadata commit failed")}, fake, Options{Upload: UploadConfig{Strategy: "document", EnableChunking: true, MaxFileSize: 50, ChunkSize: 20 * 1024 * 1024, TypeLimits: map[string]int64{"document": 20 * 1024 * 1024}, PutBufferSize: 1}})
+	_, err = store.PutObject(ctx, PutObjectInput{Bucket: "photos", Key: "large.txt", ContentType: "text/plain", Size: 5, Body: strings.NewReader("hello")})
+	if err == nil {
+		t.Fatal("PutObject returned nil error")
+	}
+	matches, err := filepath.Glob(filepath.Join(tempRoot, "tgnas-upload-*"))
+	if err != nil {
+		t.Fatalf("Glob returned error: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("staging temp files still present: %v", matches)
 	}
 }
 
@@ -530,6 +559,95 @@ func TestStoreMaxUploadsSerializationWhenSetToOne(t *testing.T) {
 	}
 	if maxConcurrent.Load() != 1 {
 		t.Fatalf("max concurrent uploads = %d", maxConcurrent.Load())
+	}
+}
+
+func TestStoreUploadGateRecordsCooldownFromFinalRateLimit(t *testing.T) {
+	ctx := context.Background()
+	meta, err := metadata.OpenSQLite(filepath.Join(t.TempDir(), "metadata.sqlite"))
+	if err != nil {
+		t.Fatalf("OpenSQLite returned error: %v", err)
+	}
+	defer meta.Close()
+	if err := meta.UpsertBucket(ctx, metadata.Bucket{Name: "photos", ChatID: "-100", CreatedAt: time.Now().UTC(), Enabled: true}); err != nil {
+		t.Fatalf("UpsertBucket returned error: %v", err)
+	}
+
+	fake := testutil.NewFakeTelegram()
+	started := make(chan string, 2)
+	fake.UploadFunc = func(ctx context.Context, request telegram.UploadRequest) (telegram.UploadedFile, error) {
+		started <- request.Filename
+		_, _ = io.ReadAll(request.Reader)
+		if request.Filename == "one.txt" {
+			return telegram.UploadedFile{}, telegram.NewRateLimitError(errors.New("Too Many Requests: retry after 1"), time.Second)
+		}
+		return telegram.UploadedFile{Type: request.Type, FileID: request.Filename, FileUniqueID: request.Filename + "-u", MessageID: 1, FileSize: 1}, nil
+	}
+	store := mustNewObjectStore(t, meta, fake, Options{Upload: DefaultUploadConfig(), MaxTelegramCalls: 2})
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := store.PutObject(ctx, PutObjectInput{Bucket: "photos", Key: "one.txt", ContentType: "text/plain", Size: 1, Body: strings.NewReader("a")})
+		firstDone <- err
+	}()
+	if first := <-started; first != "one.txt" {
+		t.Fatalf("first upload = %q, want one.txt", first)
+	}
+	if err := <-firstDone; err == nil {
+		t.Fatal("first PutObject returned nil error")
+	}
+
+	secondCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	_, err = store.PutObject(secondCtx, PutObjectInput{Bucket: "photos", Key: "two.txt", ContentType: "text/plain", Size: 1, Body: strings.NewReader("b")})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second PutObject err = %v, want context.DeadlineExceeded", err)
+	}
+	select {
+	case second := <-started:
+		t.Fatalf("second upload started during cooldown: %s", second)
+	default:
+	}
+}
+
+func TestStoreUploadSerializationDoesNotBlockDownloads(t *testing.T) {
+	ctx := context.Background()
+	objectStore, fake := newReadyTestObjectStore(t, map[string]string{"photos": "-100"})
+	_, err := objectStore.PutObject(ctx, PutObjectInput{Bucket: "photos", Key: "hello.txt", ContentType: "text/plain", Size: 5, Body: strings.NewReader("hello")})
+	if err != nil {
+		t.Fatalf("PutObject returned error: %v", err)
+	}
+
+	uploadRelease := make(chan struct{})
+	uploadStarted := make(chan struct{}, 1)
+	fake.UploadFunc = func(ctx context.Context, request telegram.UploadRequest) (telegram.UploadedFile, error) {
+		uploadStarted <- struct{}{}
+		<-uploadRelease
+		_, _ = io.ReadAll(request.Reader)
+		return telegram.UploadedFile{Type: request.Type, FileID: "upload-file", FileUniqueID: "upload-file-u", MessageID: 1, FileSize: 1}, nil
+	}
+	downloadStarted := make(chan struct{}, 1)
+	fake.DownloadFunc = func(ctx context.Context, fileID string) (io.ReadCloser, error) {
+		downloadStarted <- struct{}{}
+		return io.NopCloser(strings.NewReader(fake.Files[fileID])), nil
+	}
+
+	putDone := make(chan error, 1)
+	go func() {
+		_, err := objectStore.PutObject(ctx, PutObjectInput{Bucket: "photos", Key: "slow.txt", ContentType: "text/plain", Size: 1, Body: strings.NewReader("x")})
+		putDone <- err
+	}()
+	<-uploadStarted
+
+	reader, _, err := objectStore.GetObject(ctx, GetObjectInput{Bucket: "photos", Key: "hello.txt"})
+	if err != nil {
+		t.Fatalf("GetObject returned error: %v", err)
+	}
+	defer reader.Close()
+	<-downloadStarted
+	close(uploadRelease)
+	if err := <-putDone; err != nil {
+		t.Fatalf("PutObject returned error: %v", err)
 	}
 }
 
@@ -869,6 +987,76 @@ func TestStorePutObjectStillUsesWholeObjectMD5AndSHA256(t *testing.T) {
 	}
 	if head.SHA256 != "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" {
 		t.Fatalf("sha256 = %q", head.SHA256)
+	}
+}
+
+type nonSeekableReader struct{ io.Reader }
+
+func TestStoreChunkedUploadUsesReplayableByteReaders(t *testing.T) {
+	ctx := context.Background()
+	objectStore, fake := newReadyTestObjectStoreWithUploadConfig(t, map[string]string{"backups": "-200"}, UploadConfig{Strategy: "document", EnableChunking: true, MaxFileSize: 50, ChunkSize: 3, TypeLimits: map[string]int64{"document": 3}, PutBufferSize: 2})
+	attempts := 0
+	fake.UploadFunc = func(ctx context.Context, request telegram.UploadRequest) (telegram.UploadedFile, error) {
+		attempts++
+		if _, ok := request.Reader.(io.ReadSeeker); !ok {
+			return telegram.UploadedFile{}, fmt.Errorf("reader does not implement io.ReadSeeker")
+		}
+		data, err := io.ReadAll(request.Reader)
+		if err != nil {
+			return telegram.UploadedFile{}, err
+		}
+		return telegram.UploadedFile{Type: request.Type, FileID: fmt.Sprintf("file-%d", attempts), FileUniqueID: fmt.Sprintf("file-%d-u", attempts), MessageID: int64(attempts), FileSize: int64(len(data))}, nil
+	}
+
+	_, err := objectStore.PutObject(ctx, PutObjectInput{Bucket: "backups", Key: "big.bin", ContentType: "application/octet-stream", Size: 6, Body: strings.NewReader("abcdef")})
+	if err != nil {
+		t.Fatalf("PutObject returned error: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("upload attempts = %d, want 2", attempts)
+	}
+}
+
+func TestStorePutObjectSingleUploadRetriesThroughLocalStaging(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll returned error: %v", err)
+		}
+		_ = r.Body.Close()
+		if !strings.Contains(string(data), "hello") {
+			t.Fatalf("request body missing payload: %q", string(data))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if attempts == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"ok":false,"description":"retry later","parameters":{"retry_after":1}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":77,"document":{"file_id":"file-1","file_unique_id":"file-1-u","file_size":5}}}`))
+	}))
+	defer server.Close()
+
+	client := telegram.NewHTTPClient("token", server.URL, http.DefaultClient)
+	meta, err := metadata.OpenSQLite(filepath.Join(t.TempDir(), "metadata.sqlite"))
+	if err != nil {
+		t.Fatalf("OpenSQLite returned error: %v", err)
+	}
+	defer meta.Close()
+	ctx := context.Background()
+	if err := meta.UpsertBucket(ctx, metadata.Bucket{Name: "photos", ChatID: "-100", CreatedAt: time.Now().UTC(), Enabled: true}); err != nil {
+		t.Fatalf("UpsertBucket returned error: %v", err)
+	}
+
+	store := mustNewObjectStore(t, meta, client, Options{Upload: DefaultUploadConfig()})
+	_, err = store.PutObject(ctx, PutObjectInput{Bucket: "photos", Key: "hello.txt", ContentType: "text/plain", Size: 5, Body: nonSeekableReader{Reader: strings.NewReader("hello")}})
+	if err != nil {
+		t.Fatalf("PutObject returned error: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("upload attempts = %d, want 2", attempts)
 	}
 }
 

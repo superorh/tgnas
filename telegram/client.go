@@ -21,6 +21,41 @@ type HTTPClient struct {
 	httpClient *http.Client
 }
 
+type rateLimitError struct {
+	cause      error
+	retryAfter time.Duration
+}
+
+func (e *rateLimitError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *rateLimitError) Unwrap() error {
+	return e.cause
+}
+
+func NewRateLimitError(cause error, retryAfter time.Duration) error {
+	if cause == nil || retryAfter <= 0 {
+		return cause
+	}
+	return &rateLimitError{cause: cause, retryAfter: retryAfter}
+}
+
+func IsRateLimitError(err error) (time.Duration, bool) {
+	var target *rateLimitError
+	if !errors.As(err, &target) {
+		return 0, false
+	}
+	return target.retryAfter, true
+}
+
+func wrapRateLimitError(err error, retry bool, delay time.Duration) error {
+	if err == nil || !retry || delay <= 0 {
+		return err
+	}
+	return NewRateLimitError(err, delay)
+}
+
 var _ Client = (*HTTPClient)(nil)
 
 func NewHTTPClient(botToken, apiBaseURL string, httpClient *http.Client) *HTTPClient {
@@ -181,6 +216,7 @@ func (c *HTTPClient) uploadBody(request UploadRequest, fieldName string) (io.Rea
 
 func (c *HTTPClient) doUploadRequest(ctx context.Context, requestURL string, request UploadRequest, fieldName string) ([]byte, error) {
 	var lastErr error
+	var lastDelay time.Duration
 	readSeeker, replayable := request.Reader.(io.ReadSeeker)
 
 	for attempt := 0; attempt < 4; attempt++ {
@@ -213,6 +249,7 @@ func (c *HTTPClient) doUploadRequest(ctx context.Context, requestURL string, req
 			return nil, err
 		}
 		lastErr = err
+		lastDelay = delay
 		if !replayable {
 			return nil, safeUploadReplayError(err)
 		}
@@ -227,7 +264,7 @@ func (c *HTTPClient) doUploadRequest(ctx context.Context, requestURL string, req
 	if lastErr == nil {
 		lastErr = errors.New("telegram upload failed")
 	}
-	return nil, lastErr
+	return nil, wrapRateLimitError(lastErr, true, lastDelay)
 }
 
 func (c *HTTPClient) doSingleUploadAttempt(ctx context.Context, requestURL string, reader io.ReadCloser, contentType string) ([]byte, bool, time.Duration, error) {

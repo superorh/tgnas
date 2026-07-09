@@ -1,6 +1,7 @@
 package testutil
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -34,7 +35,7 @@ func (f *FakeTelegram) Upload(ctx context.Context, request telegram.UploadReques
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	request.Reader = strings.NewReader(string(data))
+	request.Reader = bytes.NewReader(data)
 	f.Uploads = append(f.Uploads, request)
 	fileID := fmt.Sprintf("file-%d", len(f.Uploads))
 	f.Files[fileID] = string(data)

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"crypto/rand"
@@ -8,8 +9,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log"
+	"os"
 	"path"
 	"regexp"
 	"strings"
@@ -33,11 +36,20 @@ type ObjectStore struct {
 	startupBuckets   map[string]metadata.Bucket
 	multipartMu      sync.Mutex
 	multipartUploads map[string]*multipartUpload
+	uploadGate       chan struct{}
+	uploadMu         sync.Mutex
+	uploadUntil      time.Time
 }
 
 type uploadRecord struct {
 	FileID    string
 	MessageID int64
+}
+
+type stagedUpload struct {
+	reader io.ReadSeeker
+	close  func() error
+	remove func() error
 }
 
 const maxMultipartUploads = 1000
@@ -100,7 +112,9 @@ func NewObjectStore(meta metadata.Store, tg telegram.Client, options Options) (*
 		logger:           options.Logger,
 		startupBuckets:   map[string]metadata.Bucket{},
 		multipartUploads: map[string]*multipartUpload{},
+		uploadGate:       make(chan struct{}, 1),
 	}
+	store.uploadGate <- struct{}{}
 	if store.logger == nil {
 		store.logger = log.New(io.Discard, "", 0)
 	}
@@ -354,7 +368,7 @@ func (s *ObjectStore) uploadMultipartPartChunks(ctx context.Context, input Uploa
 		uploaded, err := s.uploadTelegram(ctx, telegram.UploadRequest{
 			Type:     telegram.TypeDocument,
 			ChatID:   s.bucketChatID(input.Bucket),
-			Reader:   strings.NewReader(string(partData)),
+			Reader:   bytes.NewReader(partData),
 			Filename: path.Base(input.Key),
 			MIMEType: contentType,
 			Caption:  s.renderCaption(PutObjectInput{Bucket: input.Bucket, Key: input.Key, ContentType: contentType, Size: input.Size}, partIndex, totalParts),
@@ -799,76 +813,89 @@ func (s *ObjectStore) putEmpty(ctx context.Context, input PutObjectInput, strate
 	return PutObjectResult{ETag: etag}, nil
 }
 
-func (s *ObjectStore) putSingle(ctx context.Context, input PutObjectInput, strategy UploadStrategy) (PutObjectResult, error) {
-	type uploadResult struct {
-		uploaded telegram.UploadedFile
-		err      error
-	}
-
-	now := time.Now().UTC()
-	md5Hash := md5.New()
-	shaHash := sha256.New()
-	pipeReader, pipeWriter := io.Pipe()
-	resultCh := make(chan uploadResult, 1)
-
-	caption := s.renderCaption(input, 1, 1)
-	go func() {
-		s.logger.Printf("debug event=telegram_upload_part bucket=%q key=%q part=%d parts=%d media_type=%q", input.Bucket, input.Key, 1, 1, strategy.TelegramType)
-		uploaded, err := s.uploadTelegram(ctx, telegram.UploadRequest{
-			Type:     strategy.TelegramType,
-			ChatID:   s.bucketChatID(input.Bucket),
-			Reader:   pipeReader,
-			Filename: path.Base(input.Key),
-			MIMEType: input.ContentType,
-			Caption:  caption,
-		})
-		if err != nil {
-			_ = pipeReader.CloseWithError(err)
-			resultCh <- uploadResult{err: err}
-			return
-		}
-		s.logger.Printf("debug event=telegram_upload_part_result bucket=%q key=%q part=%d message_id=%d file_id_returned=%t", input.Bucket, input.Key, 1, uploaded.MessageID, uploaded.FileID != "")
-		_ = pipeReader.Close()
-		resultCh <- uploadResult{uploaded: uploaded}
-	}()
-
-	tee := io.TeeReader(input.Body, io.MultiWriter(md5Hash, shaHash, pipeWriter))
+func (s *ObjectStore) stageSingleUpload(input PutObjectInput, md5Hash hash.Hash, shaHash hash.Hash) (*stagedUpload, error) {
 	bufferSize := s.options.Upload.PutBufferSize
 	if bufferSize <= 0 {
 		bufferSize = DefaultUploadConfig().PutBufferSize
 	}
-	buf := make([]byte, bufferSize)
-	written, copyErr := io.CopyBuffer(io.Discard, tee, buf)
-	if closeErr := pipeWriter.Close(); copyErr == nil && closeErr != nil {
-		copyErr = closeErr
-	}
-	if written != input.Size && copyErr == nil {
-		copyErr = fmt.Errorf("copied %d bytes, want %d", written, input.Size)
-	}
-	if copyErr != nil {
-		if errors.Is(copyErr, io.ErrClosedPipe) {
-			result := <-resultCh
-			if result.err != nil {
-				return PutObjectResult{}, result.err
-			}
-			return PutObjectResult{}, copyErr
+	if input.Size <= int64(bufferSize) {
+		data, err := io.ReadAll(io.TeeReader(input.Body, io.MultiWriter(md5Hash, shaHash)))
+		if err != nil {
+			return nil, err
 		}
-		_ = pipeWriter.CloseWithError(copyErr)
-		select {
-		case result := <-resultCh:
-			if result.err != nil {
-				return PutObjectResult{}, result.err
-			}
-		default:
+		if int64(len(data)) != input.Size {
+			return nil, fmt.Errorf("copied %d bytes, want %d", len(data), input.Size)
 		}
-		return PutObjectResult{}, copyErr
+		return &stagedUpload{
+			reader: bytes.NewReader(data),
+			close:  func() error { return nil },
+			remove: func() error { return nil },
+		}, nil
 	}
 
-	result := <-resultCh
-	if result.err != nil {
-		return PutObjectResult{}, result.err
+	file, err := os.CreateTemp("", "tgnas-upload-*")
+	if err != nil {
+		return nil, err
 	}
-	uploaded := result.uploaded
+	written, err := io.Copy(file, io.TeeReader(input.Body, io.MultiWriter(md5Hash, shaHash)))
+	if err != nil {
+		file.Close()
+		os.Remove(file.Name())
+		return nil, err
+	}
+	if written != input.Size {
+		file.Close()
+		os.Remove(file.Name())
+		return nil, fmt.Errorf("copied %d bytes, want %d", written, input.Size)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		file.Close()
+		os.Remove(file.Name())
+		return nil, err
+	}
+	return &stagedUpload{
+		reader: file,
+		close:  file.Close,
+		remove: func() error { return os.Remove(file.Name()) },
+	}, nil
+}
+
+func removeStagingArtifact(logger *log.Logger, staged *stagedUpload) {
+	if staged == nil {
+		return
+	}
+	if err := staged.close(); err != nil && logger != nil {
+		logger.Printf("debug event=upload_staging_close result=error error=%q", sanitizeLogError(err))
+	}
+	if err := staged.remove(); err != nil && logger != nil {
+		logger.Printf("debug event=upload_staging_cleanup result=error error=%q", sanitizeLogError(err))
+	}
+}
+
+func (s *ObjectStore) putSingle(ctx context.Context, input PutObjectInput, strategy UploadStrategy) (PutObjectResult, error) {
+	now := time.Now().UTC()
+	md5Hash := md5.New()
+	shaHash := sha256.New()
+	staged, err := s.stageSingleUpload(input, md5Hash, shaHash)
+	if err != nil {
+		return PutObjectResult{}, err
+	}
+	defer removeStagingArtifact(s.logger, staged)
+
+	caption := s.renderCaption(input, 1, 1)
+	s.logger.Printf("debug event=telegram_upload_part bucket=%q key=%q part=%d parts=%d media_type=%q", input.Bucket, input.Key, 1, 1, strategy.TelegramType)
+	uploaded, err := s.uploadTelegram(ctx, telegram.UploadRequest{
+		Type:     strategy.TelegramType,
+		ChatID:   s.bucketChatID(input.Bucket),
+		Reader:   staged.reader,
+		Filename: path.Base(input.Key),
+		MIMEType: input.ContentType,
+		Caption:  caption,
+	})
+	if err != nil {
+		return PutObjectResult{}, err
+	}
+	s.logger.Printf("debug event=telegram_upload_part_result bucket=%q key=%q part=%d message_id=%d file_id_returned=%t", input.Bucket, input.Key, 1, uploaded.MessageID, uploaded.FileID != "")
 
 	storedSize := input.Size
 	etag := hex.EncodeToString(md5Hash.Sum(nil))
@@ -954,7 +981,7 @@ func (s *ObjectStore) putChunked(ctx context.Context, input PutObjectInput, stra
 		uploaded, err := s.uploadTelegram(ctx, telegram.UploadRequest{
 			Type:     telegram.TypeDocument,
 			ChatID:   s.bucketChatID(input.Bucket),
-			Reader:   strings.NewReader(string(partData)),
+			Reader:   bytes.NewReader(partData),
 			Filename: path.Base(input.Key),
 			MIMEType: input.ContentType,
 			Caption:  s.renderCaption(input, part, parts),
@@ -1027,12 +1054,49 @@ func (s *ObjectStore) renderCaption(input PutObjectInput, part, parts int) strin
 }
 
 func (s *ObjectStore) uploadTelegram(ctx context.Context, request telegram.UploadRequest) (telegram.UploadedFile, error) {
-	release := s.acquire(ctx, s.telegramSem)
-	if release == nil {
+	select {
+	case <-s.uploadGate:
+	case <-ctx.Done():
 		return telegram.UploadedFile{}, ctx.Err()
 	}
-	defer release()
-	return s.tg.Upload(ctx, request)
+	defer func() { s.uploadGate <- struct{}{} }()
+
+	for {
+		s.uploadMu.Lock()
+		wait := time.Until(s.uploadUntil)
+		s.uploadMu.Unlock()
+		if wait <= 0 {
+			break
+		}
+		if err := sleepWithContext(ctx, wait); err != nil {
+			return telegram.UploadedFile{}, err
+		}
+	}
+
+	uploaded, err := s.tg.Upload(ctx, request)
+	if err != nil {
+		if retryAfter, ok := telegram.IsRateLimitError(err); ok && retryAfter > 0 {
+			s.uploadMu.Lock()
+			s.uploadUntil = time.Now().Add(retryAfter)
+			s.uploadMu.Unlock()
+		}
+		return telegram.UploadedFile{}, err
+	}
+	return uploaded, nil
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (s *ObjectStore) downloadChunk(ctx context.Context, fileID string) (io.ReadCloser, error) {

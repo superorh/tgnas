@@ -241,6 +241,62 @@ func TestClientUploadRetryAfterWithReadSeekerHonorsContextDeadline(t *testing.T)
 	}
 }
 
+func TestClientUploadReturnsRateLimitErrorMetadataOnFinal429(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		mustDrainBody(t, w, r)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"ok":false,"description":"retry later","parameters":{"retry_after":1}}`))
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient("token", server.URL, &http.Client{Timeout: 10 * time.Millisecond})
+	_, err := client.Upload(context.Background(), UploadRequest{Type: TypeDocument, ChatID: "-100", Reader: strings.NewReader("hello"), Filename: "hello.txt"})
+	if err == nil {
+		t.Fatal("Upload returned nil error")
+	}
+	retryAfter, ok := IsRateLimitError(err)
+	if !ok {
+		t.Fatalf("IsRateLimitError(%v) = false, want true", err)
+	}
+	if retryAfter != time.Second {
+		t.Fatalf("retryAfter = %v, want %v", retryAfter, time.Second)
+	}
+	if attempts != 4 {
+		t.Fatalf("Upload attempts = %d, want 4", attempts)
+	}
+}
+
+func TestClientUploadSuccessfulRetryDoesNotReturnRateLimitErrorMetadata(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		mustDrainBody(t, w, r)
+		w.Header().Set("Content-Type", "application/json")
+		if attempts == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"ok":false,"description":"retry later","parameters":{"retry_after":1}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":77,"document":{"file_id":"file-1","file_unique_id":"unique-1","file_size":5}}}`))
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient("token", server.URL, http.DefaultClient)
+	_, err := client.Upload(context.Background(), UploadRequest{Type: TypeDocument, ChatID: "-100", Reader: strings.NewReader("hello"), Filename: "hello.txt"})
+	if err != nil {
+		t.Fatalf("Upload returned error: %v", err)
+	}
+	if retryAfter, ok := IsRateLimitError(err); ok {
+		t.Fatalf("IsRateLimitError(%v) = (%v, true), want false", err, retryAfter)
+	}
+	if attempts != 2 {
+		t.Fatalf("Upload attempts = %d, want 2", attempts)
+	}
+}
+
 func TestClientUploadNonSeekableReaderCannotSafelyRetry(t *testing.T) {
 	attempts := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
