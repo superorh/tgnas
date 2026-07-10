@@ -11,6 +11,7 @@ import (
 	"net/textproto"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -156,9 +157,9 @@ func (c *HTTPClient) downloadFile(ctx context.Context, filePath string) (io.Read
 				return nil, parseErr
 			}
 			if !retry {
-				return nil, statusError(resp.StatusCode, data)
+				return nil, statusError("download_read", resp.StatusCode, data)
 			}
-			lastErr = statusError(resp.StatusCode, data)
+			lastErr = statusError("download_read", resp.StatusCode, data)
 			if err := sleepWithContext(ctx, backoffDelay(ctx, c.httpClient.Timeout, attempt, delay)); err != nil {
 				return nil, err
 			}
@@ -296,7 +297,7 @@ func (c *HTTPClient) doSingleUploadAttempt(ctx context.Context, requestURL strin
 	if !retry && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return data, false, 0, nil
 	}
-	return nil, retry, delay, statusError(resp.StatusCode, data)
+	return nil, retry, delay, statusError("upload_send", resp.StatusCode, data)
 }
 
 func (c *HTTPClient) doJSONRequest(ctx context.Context, method, requestURL string, contentType string, bodyFactory func() (io.ReadCloser, string, error)) ([]byte, error) {
@@ -336,9 +337,9 @@ func (c *HTTPClient) doJSONRequest(ctx context.Context, method, requestURL strin
 				return data, nil
 			}
 			if !retry {
-				return nil, statusError(resp.StatusCode, data)
+				return nil, statusError("request", resp.StatusCode, data)
 			}
-			lastErr = statusError(resp.StatusCode, data)
+			lastErr = statusError("request", resp.StatusCode, data)
 			if err := sleepWithContext(ctx, backoffDelay(ctx, c.httpClient.Timeout, attempt, delay)); err != nil {
 				return nil, err
 			}
@@ -505,14 +506,30 @@ func sleepWithContext(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func statusError(statusCode int, data []byte) error {
+func statusError(operation string, statusCode int, data []byte) error {
+	description := ""
 	if len(data) > 0 {
 		var envelope telegramErrorEnvelope
 		if json.Unmarshal(data, &envelope) == nil && envelope.Description != "" {
-			return telegramAPIError(envelope.Description)
+			description = strings.TrimSpace(envelope.Description)
 		}
 	}
-	return fmt.Errorf("telegram request failed with status %d", statusCode)
+	if description == "" {
+		description = "telegram request failed with status " + strconv.Itoa(statusCode)
+	}
+	return NewRequestError(operation, statusCode, classifyStatusReason(statusCode, description), errors.New(description))
+}
+
+func classifyStatusReason(statusCode int, description string) string {
+	text := strings.ToLower(strings.TrimSpace(description))
+	switch {
+	case statusCode == http.StatusUnauthorized || strings.Contains(text, "unauthorized"):
+		return "unauthorized"
+	case statusCode == http.StatusForbidden && strings.Contains(text, "forbidden"):
+		return "forbidden"
+	default:
+		return "http_" + strconv.Itoa(statusCode)
+	}
 }
 
 func telegramAPIError(description string) error {

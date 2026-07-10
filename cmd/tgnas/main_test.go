@@ -860,6 +860,59 @@ func TestRunServiceWithDebugDisablesOrphanBuckets(t *testing.T) {
 	}
 }
 
+func TestRunServiceCreatesBucketSpecificTelegramClients(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	metadataPath := filepath.Join(t.TempDir(), "metadata.sqlite")
+	err := os.WriteFile(configPath, []byte(`
+auth:
+  credentials:
+    - access_key: "admin"
+      secret_key_env: "SECRET"
+telegram:
+  bot_token: "${TGNAS_GLOBAL_TOKEN}"
+  api_base_url: "https://api.telegram.org"
+metadata:
+  sqlite_path: "`+metadataPath+`"
+buckets:
+  photos:
+    chat_id: "-100123"
+    bot_token: "${TGNAS_PHOTOS_TOKEN}"
+  archive:
+    chat_id: "-100456"
+`), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SECRET", "secret")
+	t.Setenv("TGNAS_GLOBAL_TOKEN", "222:global")
+	t.Setenv("TGNAS_PHOTOS_TOKEN", "111:photos")
+
+	captured := store.Options{}
+	oldNewObjectStore := newObjectStore
+	newObjectStore = func(meta metadata.Store, tg telegram.Client, options store.Options) (*store.ObjectStore, error) {
+		captured = options
+		return store.NewObjectStore(meta, tg, options)
+	}
+	defer func() { newObjectStore = oldNewObjectStore }()
+	oldListen := listenAndServe
+	listenAndServe = func(addr string, handler http.Handler) error { return errors.New("stop after setup") }
+	defer func() { listenAndServe = oldListen }()
+
+	err = runServiceWithDebug(configPath, serverModeS3, newDebugLogger(false, io.Discard))
+	if err == nil || !strings.Contains(err.Error(), "stop after setup") {
+		t.Fatalf("runServiceWithDebug error = %v", err)
+	}
+	if len(captured.Buckets) != 2 {
+		t.Fatalf("len(captured.Buckets) = %d, want 2", len(captured.Buckets))
+	}
+	if captured.Buckets["photos"].TokenSource != "bucket" {
+		t.Fatalf("photos source = %q, want bucket", captured.Buckets["photos"].TokenSource)
+	}
+	if captured.Buckets["archive"].TokenSource != "global" {
+		t.Fatalf("archive source = %q, want global", captured.Buckets["archive"].TokenSource)
+	}
+}
+
 func TestModuleAndImportsUseTgnasPath(t *testing.T) {
 	repoRoot := filepath.Join("..", "..")
 	oldPath := "github.com/aahl/" + "tgs3"

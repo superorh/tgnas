@@ -56,6 +56,7 @@ type CredentialConfig struct {
 }
 
 type TelegramConfig struct {
+	BotToken        string        `yaml:"bot_token"`
 	BotTokenEnv     string        `yaml:"bot_token_env"`
 	APIBaseURL      string        `yaml:"api_base_url"`
 	CaptionTemplate string        `yaml:"caption_template"`
@@ -83,6 +84,7 @@ type StorageConfig struct {
 
 type BucketConfig struct {
 	ChatID     string `yaml:"chat_id"`
+	BotToken   string `yaml:"bot_token"`
 	PublicRead bool   `yaml:"public_read"`
 }
 
@@ -154,6 +156,13 @@ func LoadFile(path string) (Config, error) {
 			return Config{}, fmt.Errorf("resolve bucket %q chat_id: %w", name, err)
 		}
 		bucket.ChatID = chatID
+		if strings.TrimSpace(bucket.BotToken) != "" {
+			resolvedToken, err := resolveConfigValue(bucket.BotToken)
+			if err != nil {
+				return Config{}, fmt.Errorf("resolve bucket %q bot_token: %w", name, err)
+			}
+			bucket.BotToken = resolvedToken
+		}
 		cfg.Buckets[name] = bucket
 	}
 
@@ -200,8 +209,37 @@ func (c Config) ResolveSecret(envName string) string {
 	return os.Getenv(envName)
 }
 
-func (c Config) ResolveBotToken() string {
-	return c.ResolveSecret(c.Telegram.BotTokenEnv)
+func (c Config) ResolveBotToken() (string, string, error) {
+	if strings.TrimSpace(c.Telegram.BotToken) != "" {
+		value, err := resolveConfigValue(c.Telegram.BotToken)
+		if err != nil {
+			return "", "", err
+		}
+		if strings.TrimSpace(value) != "" {
+			return value, "global", nil
+		}
+	}
+	if strings.TrimSpace(c.Telegram.BotTokenEnv) != "" {
+		return c.ResolveSecret(c.Telegram.BotTokenEnv), "global_env", nil
+	}
+	return "", "", nil
+}
+
+func (c Config) ResolveBucketToken(name string) (string, string, error) {
+	bucket, ok := c.Buckets[name]
+	if !ok {
+		return "", "", fmt.Errorf("bucket %q not configured", name)
+	}
+	if strings.TrimSpace(bucket.BotToken) != "" {
+		value, err := resolveConfigValue(bucket.BotToken)
+		if err != nil {
+			return "", "", fmt.Errorf("resolve bucket %q bot_token: %w", name, err)
+		}
+		if strings.TrimSpace(value) != "" {
+			return value, "bucket", nil
+		}
+	}
+	return c.ResolveBotToken()
 }
 
 func (c Config) ResolveSQLitePath() (string, error) {
@@ -246,9 +284,6 @@ func (c Config) Validate() error {
 		}
 	}
 
-	if strings.TrimSpace(c.Telegram.BotTokenEnv) == "" {
-		return fmt.Errorf("telegram bot token env is required")
-	}
 	if strings.TrimSpace(c.Telegram.APIBaseURL) == "" {
 		return fmt.Errorf("telegram api base url is required")
 	}
@@ -333,7 +368,7 @@ func applyStorageDefaults(storage *StorageConfig) {
 	}
 }
 
-func resolveBucketChatID(value string) (string, error) {
+func resolveConfigValue(value string) (string, error) {
 	hasEnvReference := strings.Contains(value, "${") || strings.Contains(value, "}")
 	isFullEnvReference := strings.HasPrefix(value, "${") && strings.HasSuffix(value, "}") && strings.Count(value, "${") == 1 && strings.Count(value, "}") == 1
 	if hasEnvReference && !isFullEnvReference {
@@ -344,6 +379,10 @@ func resolveBucketChatID(value string) (string, error) {
 		return os.Getenv(envName), nil
 	}
 	return value, nil
+}
+
+func resolveBucketChatID(value string) (string, error) {
+	return resolveConfigValue(value)
 }
 
 func boolPtr(v bool) *bool {

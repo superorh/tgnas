@@ -60,8 +60,10 @@ buckets:
 	if got := cfg.ResolveSecret(cfg.Auth.Credentials[0].SecretKeyEnv); got != "secret" {
 		t.Fatalf("secret = %q", got)
 	}
-	if got := cfg.ResolveBotToken(); got != "bot-token" {
-		t.Fatalf("bot token = %q", got)
+	if token, _, err := cfg.ResolveBotToken(); err != nil {
+		t.Fatalf("ResolveBotToken returned error: %v", err)
+	} else if token != "bot-token" {
+		t.Fatalf("bot token = %q", token)
 	}
 }
 
@@ -546,5 +548,134 @@ func TestWebDAVPrefixRejectsBucketNameConflict(t *testing.T) {
 	err := cfg.validateWebDAV()
 	if err == nil || !strings.Contains(err.Error(), "conflicts with bucket") {
 		t.Fatalf("expected bucket conflict rejected, got %v", err)
+	}
+}
+
+func TestResolveBotTokenPrefersExplicitValueBeforeEnvName(t *testing.T) {
+	cfg := Config{
+		Telegram: TelegramConfig{
+			BotToken:    "${TGNAS_BOT_TOKEN_VALUE}",
+			BotTokenEnv: "TGNAS_BOT_TOKEN_ENV",
+		},
+	}
+	t.Setenv("TGNAS_BOT_TOKEN_VALUE", "123:explicit")
+	t.Setenv("TGNAS_BOT_TOKEN_ENV", "456:legacy")
+
+	token, source, err := cfg.ResolveBotToken()
+	if err != nil {
+		t.Fatalf("ResolveBotToken returned error: %v", err)
+	}
+	if token != "123:explicit" {
+		t.Fatalf("token = %q, want %q", token, "123:explicit")
+	}
+	if source != "global" {
+		t.Fatalf("source = %q, want %q", source, "global")
+	}
+}
+
+func TestResolveBucketTokenPrefersBucketThenGlobalThenLegacyEnv(t *testing.T) {
+	cfg := Config{
+		Telegram: TelegramConfig{
+			BotToken:    "${TGNAS_GLOBAL_TOKEN}",
+			BotTokenEnv: "TGNAS_LEGACY_TOKEN",
+		},
+		Buckets: map[string]BucketConfig{
+			"photos":  {ChatID: "-100", BotToken: "${TGNAS_BUCKET_TOKEN}"},
+			"archive": {ChatID: "-200"},
+		},
+	}
+	t.Setenv("TGNAS_BUCKET_TOKEN", "111:bucket")
+	t.Setenv("TGNAS_GLOBAL_TOKEN", "222:global")
+	t.Setenv("TGNAS_LEGACY_TOKEN", "333:legacy")
+
+	bucketToken, bucketSource, err := cfg.ResolveBucketToken("photos")
+	if err != nil {
+		t.Fatalf("ResolveBucketToken(photos) returned error: %v", err)
+	}
+	if bucketToken != "111:bucket" || bucketSource != "bucket" {
+		t.Fatalf("photos = (%q, %q), want (%q, %q)", bucketToken, bucketSource, "111:bucket", "bucket")
+	}
+
+	globalToken, globalSource, err := cfg.ResolveBucketToken("archive")
+	if err != nil {
+		t.Fatalf("ResolveBucketToken(archive) returned error: %v", err)
+	}
+	if globalToken != "222:global" || globalSource != "global" {
+		t.Fatalf("archive = (%q, %q), want (%q, %q)", globalToken, globalSource, "222:global", "global")
+	}
+}
+
+func TestResolveBucketTokenFallsBackToLegacyEnvWhenExplicitGlobalEmpty(t *testing.T) {
+	cfg := Config{
+		Telegram: TelegramConfig{
+			BotToken:    "${TGNAS_EMPTY_TOKEN}",
+			BotTokenEnv: "TGNAS_LEGACY_TOKEN",
+		},
+		Buckets: map[string]BucketConfig{
+			"photos": {ChatID: "-100"},
+		},
+	}
+	t.Setenv("TGNAS_EMPTY_TOKEN", "")
+	t.Setenv("TGNAS_LEGACY_TOKEN", "333:legacy")
+
+	token, source, err := cfg.ResolveBucketToken("photos")
+	if err != nil {
+		t.Fatalf("ResolveBucketToken returned error: %v", err)
+	}
+	if token != "333:legacy" || source != "global_env" {
+		t.Fatalf("ResolveBucketToken = (%q, %q), want (%q, %q)", token, source, "333:legacy", "global_env")
+	}
+}
+
+func TestLoadFileRejectsInvalidPartialEnvReferenceInBucketToken(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	err := os.WriteFile(path, []byte(`
+auth:
+  credentials:
+    - access_key: "admin"
+      secret_key_env: "SECRET"
+telegram:
+  bot_token_env: "BOT_TOKEN"
+buckets:
+  photos:
+    chat_id: "-100123"
+    bot_token: "prefix-${TGNAS_BUCKET_TOKEN}"
+`), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = LoadFile(path)
+	if err == nil || !strings.Contains(err.Error(), "environment reference must use full ${ENV_NAME} form") {
+		t.Fatalf("LoadFile error = %v", err)
+	}
+}
+
+func TestLoadFileAllowsMissingTelegramBotTokenEnvWhenExplicitBotTokenIsUsed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	err := os.WriteFile(path, []byte(`
+auth:
+  credentials:
+    - access_key: "admin"
+      secret_key_env: "SECRET"
+telegram:
+  bot_token: "${TGNAS_GLOBAL_TOKEN}"
+buckets:
+  photos:
+    chat_id: "-100123"
+`), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TGNAS_GLOBAL_TOKEN", "123:global")
+
+	cfg, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile returned error: %v", err)
+	}
+	if token, source, err := cfg.ResolveBucketToken("photos"); err != nil || token != "123:global" || source != "global" {
+		t.Fatalf("ResolveBucketToken = (%q, %q, %v)", token, source, err)
 	}
 }

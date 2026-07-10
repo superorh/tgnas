@@ -20,6 +20,7 @@ var (
 	ErrInvalidPart          = errors.New("invalid part")
 	ErrInvalidPartOrder     = errors.New("invalid part order")
 	ErrInvalidArgument      = errors.New("invalid argument")
+	ErrUnavailable         = errors.New("bucket unavailable")
 )
 
 type PutObjectInput struct {
@@ -136,9 +137,18 @@ func DefaultUploadConfig() UploadConfig {
 	}
 }
 
+type BucketBinding struct {
+	Name        string
+	ChatID      string
+	TokenSource string
+	TokenKey    string
+	Telegram    telegram.Client
+}
+
 type Options struct {
 	Upload           UploadConfig
 	Caption          *telegram.CaptionTemplate
+	Buckets          map[string]BucketBinding
 	MaxUploads       int
 	MaxDownloads     int
 	MaxTelegramCalls int

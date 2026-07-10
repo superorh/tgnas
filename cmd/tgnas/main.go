@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -34,6 +36,11 @@ func validateBotToken(token string) error {
 		return fmt.Errorf("invalid Telegram bot token prefix")
 	}
 	return nil
+}
+
+func tokenKey(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
 }
 
 type serverMode string
@@ -731,11 +738,6 @@ func runServiceWithDebug(configPath string, mode serverMode, dbg debugLogger) er
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	botToken := cfg.ResolveBotToken()
-	if err := validateBotToken(botToken); err != nil {
-		return fmt.Errorf("validate bot token: %w", err)
-	}
-
 	caption, err := telegram.ParseCaptionTemplate(cfg.Telegram.CaptionTemplate)
 	if err != nil {
 		return fmt.Errorf("parse caption template: %w", err)
@@ -764,9 +766,24 @@ func runServiceWithDebug(configPath string, mode serverMode, dbg debugLogger) er
 
 	ctx := context.Background()
 	var configuredNames []string
+	bucketBindings := map[string]store.BucketBinding{}
 	for name, bucket := range cfg.Buckets {
-		dbg.Printf("bucket=%q upsert=configured", name)
+		finalToken, source, err := cfg.ResolveBucketToken(name)
+		if err != nil {
+			return fmt.Errorf("resolve bucket %s bot token: %w", name, err)
+		}
+		if strings.TrimSpace(finalToken) == "" {
+			return fmt.Errorf("resolve bucket %s bot token: empty final token", name)
+		}
+		dbg.Printf("bucket=%q upsert=configured token_source=%q", name, source)
 		configuredNames = append(configuredNames, name)
+		bucketBindings[name] = store.BucketBinding{
+			Name:        name,
+			ChatID:      bucket.ChatID,
+			TokenSource: source,
+			TokenKey:    tokenKey(finalToken),
+			Telegram:    telegram.NewHTTPClient(finalToken, cfg.Telegram.APIBaseURL, &http.Client{Timeout: cfg.Telegram.Timeout}),
+		}
 		if err := meta.UpsertBucket(ctx, metadata.Bucket{
 			Name:      name,
 			ChatID:    bucket.ChatID,
@@ -780,8 +797,7 @@ func runServiceWithDebug(configPath string, mode serverMode, dbg debugLogger) er
 		return fmt.Errorf("disable removed buckets: %w", err)
 	}
 
-	tg := telegram.NewHTTPClient(botToken, cfg.Telegram.APIBaseURL, &http.Client{Timeout: cfg.Telegram.Timeout})
-	objectStore, err := newObjectStore(meta, tg, store.Options{
+	objectStore, err := newObjectStore(meta, nil, store.Options{
 		Upload: store.UploadConfig{
 			Strategy:       cfg.Storage.UploadTypeStrategy,
 			EnableChunking: *cfg.Storage.EnableChunking,
@@ -791,6 +807,7 @@ func runServiceWithDebug(configPath string, mode serverMode, dbg debugLogger) er
 			PutBufferSize:  cfg.Storage.PutBufferSize,
 		},
 		Caption:          caption,
+		Buckets:          bucketBindings,
 		MaxUploads:       cfg.Storage.MaxConcurrentUploads,
 		MaxDownloads:     cfg.Storage.MaxConcurrentDownloads,
 		MaxTelegramCalls: cfg.Storage.MaxConcurrentTelegramRequests,

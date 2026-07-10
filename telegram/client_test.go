@@ -539,6 +539,36 @@ func TestClientDownloadTransportErrorRedactsToken(t *testing.T) {
 	}
 }
 
+func TestClientUploadUnauthorizedReturnsClassifiedRequestError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mustDrainBody(t, w, r)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"ok":false,"description":"Unauthorized"}`))
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient("token", server.URL, http.DefaultClient)
+	_, err := client.Upload(context.Background(), UploadRequest{Type: TypeDocument, ChatID: "-100", Reader: strings.NewReader("hello"), Filename: "hello.txt"})
+	if err == nil {
+		t.Fatal("Upload returned nil error")
+	}
+
+	requestErr, ok := ClassifyRequestError(err)
+	if !ok {
+		t.Fatalf("ClassifyRequestError(%v) = false, want true", err)
+	}
+	if requestErr.Operation != "upload_send" {
+		t.Fatalf("operation = %q, want %q", requestErr.Operation, "upload_send")
+	}
+	if requestErr.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", requestErr.StatusCode, http.StatusUnauthorized)
+	}
+	if requestErr.Reason != "unauthorized" {
+		t.Fatalf("reason = %q, want %q", requestErr.Reason, "unauthorized")
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {

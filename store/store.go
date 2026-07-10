@@ -24,26 +24,33 @@ import (
 )
 
 type ObjectStore struct {
-	meta             metadata.Store
-	tg               telegram.Client
-	options          Options
-	resolver         *UploadStrategyResolver
-	locker           *KeyedLocker
-	uploads          chan struct{}
-	downloads        chan struct{}
-	telegramSem      chan struct{}
-	logger           *log.Logger
-	startupBuckets   map[string]metadata.Bucket
-	multipartMu      sync.Mutex
-	multipartUploads map[string]*multipartUpload
-	uploadGate       chan struct{}
-	uploadMu         sync.Mutex
-	uploadUntil      time.Time
+	meta               metadata.Store
+	tg                 telegram.Client
+	options            Options
+	resolver           *UploadStrategyResolver
+	locker             *KeyedLocker
+	uploads            chan struct{}
+	downloads          chan struct{}
+	telegramSem        chan struct{}
+	logger             *log.Logger
+	startupBuckets     map[string]metadata.Bucket
+	bucketBindings     map[string]BucketBinding
+	uploadGates        map[string]*uploadGate
+	multipartMu        sync.Mutex
+	multipartUploads   map[string]*multipartUpload
+	unavailableMu      sync.RWMutex
+	unavailableBuckets map[string]bool
 }
 
 type uploadRecord struct {
 	FileID    string
 	MessageID int64
+}
+
+type uploadGate struct {
+	slot  chan struct{}
+	mu    sync.Mutex
+	until time.Time
 }
 
 type stagedUpload struct {
@@ -79,6 +86,12 @@ type multipartChunk struct {
 	sha256               string
 }
 
+func newUploadGate() *uploadGate {
+	gate := &uploadGate{slot: make(chan struct{}, 1)}
+	gate.slot <- struct{}{}
+	return gate
+}
+
 func NewObjectStore(meta metadata.Store, tg telegram.Client, options Options) (*ObjectStore, error) {
 	upload := options.Upload
 	if upload.Strategy == "" && upload.MaxFileSize == 0 && upload.ChunkSize == 0 && upload.TypeLimits == nil && upload.PutBufferSize == 0 {
@@ -104,19 +117,31 @@ func NewObjectStore(meta metadata.Store, tg telegram.Client, options Options) (*
 	options.Upload = upload
 
 	store := &ObjectStore{
-		meta:             meta,
-		tg:               tg,
-		options:          options,
-		resolver:         NewUploadStrategyResolver(upload),
-		locker:           NewKeyedLocker(),
-		logger:           options.Logger,
-		startupBuckets:   map[string]metadata.Bucket{},
-		multipartUploads: map[string]*multipartUpload{},
-		uploadGate:       make(chan struct{}, 1),
+		meta:               meta,
+		tg:                 tg,
+		options:            options,
+		resolver:           NewUploadStrategyResolver(upload),
+		locker:             NewKeyedLocker(),
+		logger:             options.Logger,
+		startupBuckets:     map[string]metadata.Bucket{},
+		bucketBindings:     map[string]BucketBinding{},
+		uploadGates:        map[string]*uploadGate{},
+		multipartUploads:   map[string]*multipartUpload{},
+		unavailableBuckets: map[string]bool{},
 	}
-	store.uploadGate <- struct{}{}
 	if store.logger == nil {
 		store.logger = log.New(io.Discard, "", 0)
+	}
+	for name, binding := range options.Buckets {
+		store.bucketBindings[name] = binding
+		if _, ok := store.uploadGates[binding.TokenKey]; !ok {
+			store.uploadGates[binding.TokenKey] = newUploadGate()
+		}
+	}
+	if tg != nil {
+		if _, ok := store.uploadGates[""]; !ok {
+			store.uploadGates[""] = newUploadGate()
+		}
 	}
 	if options.MaxUploads > 0 {
 		store.uploads = make(chan struct{}, options.MaxUploads)
@@ -131,6 +156,11 @@ func NewObjectStore(meta metadata.Store, tg telegram.Client, options Options) (*
 		for _, bucket := range buckets {
 			if !bucket.Enabled {
 				continue
+			}
+			if tg == nil {
+				if _, ok := options.Buckets[bucket.Name]; !ok {
+					return nil, fmt.Errorf("missing runtime bucket binding for %q", bucket.Name)
+				}
 			}
 			store.startupBuckets[bucket.Name] = bucket
 		}
@@ -148,7 +178,30 @@ func (s *ObjectStore) HeadBucket(ctx context.Context, name string) error {
 	if _, ok := s.startupBuckets[name]; !ok {
 		return ErrNoSuchBucket
 	}
+	if s.isBucketUnavailable(name) {
+		return ErrUnavailable
+	}
 	return nil
+}
+
+func (s *ObjectStore) isBucketUnavailable(name string) bool {
+	s.unavailableMu.RLock()
+	defer s.unavailableMu.RUnlock()
+	return s.unavailableBuckets[name]
+}
+
+func (s *ObjectStore) markBucketUnavailable(name string) {
+	s.unavailableMu.Lock()
+	defer s.unavailableMu.Unlock()
+	s.unavailableBuckets[name] = true
+}
+
+func shouldMarkBucketUnavailable(err error) bool {
+	requestErr, ok := telegram.ClassifyRequestError(err)
+	if !ok {
+		return false
+	}
+	return requestErr.Operation == "upload_send" && requestErr.Reason == "unauthorized"
 }
 
 func (s *ObjectStore) DeleteBucket(ctx context.Context, name string) error {
@@ -365,9 +418,16 @@ func (s *ObjectStore) uploadMultipartPartChunks(ctx context.Context, input Uploa
 		_, _ = md5Hash.Write(partData)
 		chunkSHA := sha256.Sum256(partData)
 		totalParts := int((input.Size + chunkSize - 1) / chunkSize)
-		uploaded, err := s.uploadTelegram(ctx, telegram.UploadRequest{
+		binding, err := s.bucketBinding(input.Bucket)
+		if err != nil {
+			if len(uploads) > 0 {
+				s.logOrphanUpload(input.Bucket, input.Key, uploads, err)
+			}
+			return nil, "", nil, 0, err
+		}
+		uploaded, err := s.uploadTelegram(ctx, binding, telegram.UploadRequest{
 			Type:     telegram.TypeDocument,
-			ChatID:   s.bucketChatID(input.Bucket),
+			ChatID:   binding.ChatID,
 			Reader:   bytes.NewReader(partData),
 			Filename: path.Base(input.Key),
 			MIMEType: contentType,
@@ -583,8 +643,13 @@ func (s *ObjectStore) GetObject(ctx context.Context, input GetObjectInput) (io.R
 		defer cancel()
 		defer releaseDownload()
 		defer pw.Close()
+		binding, err := s.bucketBinding(input.Bucket)
+		if err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
 		for _, chunk := range selected {
-			reader, err := s.downloadChunk(ctx, chunk.FileID)
+			reader, err := s.downloadChunk(ctx, binding, chunk.FileID)
 			if err != nil {
 				_ = pw.CloseWithError(err)
 				return
@@ -882,11 +947,15 @@ func (s *ObjectStore) putSingle(ctx context.Context, input PutObjectInput, strat
 	}
 	defer removeStagingArtifact(s.logger, staged)
 
+	binding, err := s.bucketBinding(input.Bucket)
+	if err != nil {
+		return PutObjectResult{}, err
+	}
 	caption := s.renderCaption(input, 1, 1)
 	s.logger.Printf("debug event=telegram_upload_part bucket=%q key=%q part=%d parts=%d media_type=%q", input.Bucket, input.Key, 1, 1, strategy.TelegramType)
-	uploaded, err := s.uploadTelegram(ctx, telegram.UploadRequest{
+	uploaded, err := s.uploadTelegram(ctx, binding, telegram.UploadRequest{
 		Type:     strategy.TelegramType,
-		ChatID:   s.bucketChatID(input.Bucket),
+		ChatID:   binding.ChatID,
 		Reader:   staged.reader,
 		Filename: path.Base(input.Key),
 		MIMEType: input.ContentType,
@@ -978,9 +1047,16 @@ func (s *ObjectStore) putChunked(ctx context.Context, input PutObjectInput, stra
 		_, _ = wholeSHA.Write(partData)
 		chunkSHA := sha256.Sum256(partData)
 		s.logger.Printf("debug event=telegram_upload_part bucket=%q key=%q part=%d parts=%d media_type=%q", input.Bucket, input.Key, part, parts, telegram.TypeDocument)
-		uploaded, err := s.uploadTelegram(ctx, telegram.UploadRequest{
+		binding, err := s.bucketBinding(input.Bucket)
+		if err != nil {
+			if len(uploads) > 0 {
+				s.logOrphanUpload(input.Bucket, input.Key, uploads, err)
+			}
+			return PutObjectResult{}, err
+		}
+		uploaded, err := s.uploadTelegram(ctx, binding, telegram.UploadRequest{
 			Type:     telegram.TypeDocument,
-			ChatID:   s.bucketChatID(input.Bucket),
+			ChatID:   binding.ChatID,
 			Reader:   bytes.NewReader(partData),
 			Filename: path.Base(input.Key),
 			MIMEType: input.ContentType,
@@ -1038,6 +1114,25 @@ func (s *ObjectStore) putChunked(ctx context.Context, input PutObjectInput, stra
 	return PutObjectResult{ETag: etag}, nil
 }
 
+func (s *ObjectStore) bucketBinding(name string) (BucketBinding, error) {
+	binding, ok := s.bucketBindings[name]
+	if !ok {
+		if item, ok := s.startupBuckets[name]; ok && s.tg != nil {
+			return BucketBinding{Name: name, ChatID: item.ChatID, TokenKey: "", Telegram: s.tg}, nil
+		}
+		return BucketBinding{}, ErrNoSuchBucket
+	}
+	if binding.ChatID == "" {
+		if item, ok := s.startupBuckets[name]; ok {
+			binding.ChatID = item.ChatID
+		}
+	}
+	if binding.Telegram == nil && s.tg != nil {
+		binding.Telegram = s.tg
+	}
+	return binding, nil
+}
+
 func (s *ObjectStore) renderCaption(input PutObjectInput, part, parts int) string {
 	if s.options.Caption == nil {
 		return ""
@@ -1053,18 +1148,22 @@ func (s *ObjectStore) renderCaption(input PutObjectInput, part, parts int) strin
 	})
 }
 
-func (s *ObjectStore) uploadTelegram(ctx context.Context, request telegram.UploadRequest) (telegram.UploadedFile, error) {
+func (s *ObjectStore) uploadTelegram(ctx context.Context, binding BucketBinding, request telegram.UploadRequest) (telegram.UploadedFile, error) {
+	gate, ok := s.uploadGates[binding.TokenKey]
+	if !ok {
+		return telegram.UploadedFile{}, fmt.Errorf("missing upload gate for token key %q", binding.TokenKey)
+	}
 	select {
-	case <-s.uploadGate:
+	case <-gate.slot:
 	case <-ctx.Done():
 		return telegram.UploadedFile{}, ctx.Err()
 	}
-	defer func() { s.uploadGate <- struct{}{} }()
+	defer func() { gate.slot <- struct{}{} }()
 
 	for {
-		s.uploadMu.Lock()
-		wait := time.Until(s.uploadUntil)
-		s.uploadMu.Unlock()
+		gate.mu.Lock()
+		wait := time.Until(gate.until)
+		gate.mu.Unlock()
 		if wait <= 0 {
 			break
 		}
@@ -1073,12 +1172,15 @@ func (s *ObjectStore) uploadTelegram(ctx context.Context, request telegram.Uploa
 		}
 	}
 
-	uploaded, err := s.tg.Upload(ctx, request)
+	uploaded, err := binding.Telegram.Upload(ctx, request)
 	if err != nil {
 		if retryAfter, ok := telegram.IsRateLimitError(err); ok && retryAfter > 0 {
-			s.uploadMu.Lock()
-			s.uploadUntil = time.Now().Add(retryAfter)
-			s.uploadMu.Unlock()
+			gate.mu.Lock()
+			gate.until = time.Now().Add(retryAfter)
+			gate.mu.Unlock()
+		}
+		if shouldMarkBucketUnavailable(err) {
+			s.markBucketUnavailable(binding.Name)
 		}
 		return telegram.UploadedFile{}, err
 	}
@@ -1099,12 +1201,12 @@ func sleepWithContext(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func (s *ObjectStore) downloadChunk(ctx context.Context, fileID string) (io.ReadCloser, error) {
+func (s *ObjectStore) downloadChunk(ctx context.Context, binding BucketBinding, fileID string) (io.ReadCloser, error) {
 	release := s.acquire(ctx, s.telegramSem)
 	if release == nil {
 		return nil, ctx.Err()
 	}
-	reader, err := s.tg.Download(ctx, fileID)
+	reader, err := binding.Telegram.Download(ctx, fileID)
 	if err != nil {
 		release()
 		return nil, err
@@ -1215,9 +1317,9 @@ func (r *cancelReadCloser) Close() error {
 }
 
 func (s *ObjectStore) bucketChatID(bucket string) string {
-	item, ok := s.startupBuckets[bucket]
-	if !ok {
+	binding, err := s.bucketBinding(bucket)
+	if err != nil {
 		return ""
 	}
-	return item.ChatID
+	return binding.ChatID
 }
