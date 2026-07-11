@@ -556,6 +556,31 @@ func publicReadBucketsFromConfig(cfg config.Config) map[string]bool {
 	return publicReadBuckets
 }
 
+func compileCORSPolicyFromConfig(cfg config.Config) (*s3api.CORSPolicy, error) {
+	bucketRules := make(map[string][]string, len(cfg.Buckets))
+	for name, bucket := range cfg.Buckets {
+		bucketRules[name] = bucket.AllowedOrigins
+	}
+	return s3api.CompileCORSPolicy(cfg.Server.AllowedOrigins, bucketRules)
+}
+
+func s3OptionsFromConfig(
+	cfg config.Config,
+	credentials map[string]string,
+	ready func() bool,
+	logger *log.Logger,
+	corsPolicy *s3api.CORSPolicy,
+) s3api.Options {
+	return s3api.Options{
+		Region:            cfg.Auth.Region,
+		Credentials:       credentials,
+		PublicReadBuckets: publicReadBucketsFromConfig(cfg),
+		Ready:             ready,
+		Logger:            logger,
+		CORS:              corsPolicy,
+	}
+}
+
 type trustedProxyMiddleware struct {
 	next   http.Handler
 	trust  trustedProxyTrust
@@ -738,6 +763,11 @@ func runServiceWithDebug(configPath string, mode serverMode, dbg debugLogger) er
 		return fmt.Errorf("load config: %w", err)
 	}
 
+	corsPolicy, err := compileCORSPolicyFromConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("configure S3 CORS: %w", err)
+	}
+
 	caption, err := telegram.ParseCaptionTemplate(cfg.Telegram.CaptionTemplate)
 	if err != nil {
 		return fmt.Errorf("parse caption template: %w", err)
@@ -820,13 +850,13 @@ func runServiceWithDebug(configPath string, mode serverMode, dbg debugLogger) er
 	ready.Store(true)
 
 	var handler http.Handler
-	s3Handler := s3api.NewServer(objectStore, s3api.Options{
-		Region:            cfg.Auth.Region,
-		Credentials:       secrets,
-		PublicReadBuckets: publicReadBucketsFromConfig(cfg),
-		Ready:             ready.Load,
-		Logger:            dbg.StdLogger(),
-	})
+	s3Handler := s3api.NewServer(objectStore, s3OptionsFromConfig(
+		cfg,
+		secrets,
+		ready.Load,
+		dbg.StdLogger(),
+		corsPolicy,
+	))
 	if mode == serverModeS3 {
 		handler = s3Handler
 	} else {

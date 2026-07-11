@@ -40,6 +40,7 @@ type Options struct {
 	SigV4Clock        func() time.Time
 	SigV4MaxSkew      time.Duration
 	Logger            *log.Logger
+	CORS              *CORSPolicy
 }
 
 type Server struct {
@@ -48,6 +49,7 @@ type Server struct {
 	verify            *SigV4Verifier
 	publicReadBuckets map[string]bool
 	logger            *log.Logger
+	cors              *CORSPolicy
 }
 
 func NewServer(objectStore ObjectStore, options Options) http.Handler {
@@ -79,6 +81,7 @@ func NewServer(objectStore ObjectStore, options Options) http.Handler {
 		verify:            NewSigV4Verifier(options.Region, options.Credentials, verifierOptions...),
 		publicReadBuckets: publicReadBuckets,
 		logger:            logger,
+		cors:              options.CORS,
 	}
 }
 
@@ -104,6 +107,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = io.WriteString(w, "not ready")
+		return
+	}
+
+	if s.handleCORS(w, r) {
 		return
 	}
 
@@ -143,6 +150,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.handleObject(w, r, bucket, key)
+}
+
+func (s *Server) handleCORS(w http.ResponseWriter, r *http.Request) bool {
+	bucket, _, hasBucket := splitPath(r.URL)
+	matcher := s.cors.matcherForBucket(bucket, hasBucket)
+	if len(matcher.rules) == 0 {
+		return false
+	}
+	addVary(w.Header(), "Origin")
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false
+	}
+	if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+		corsPreflight(w, r, matcher)
+		return true
+	}
+	originAllowed(w, r, matcher)
+	return false
 }
 
 func allowsPresignedRequest(r *http.Request) bool {

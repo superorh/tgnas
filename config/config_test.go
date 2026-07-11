@@ -3,10 +3,67 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestLoadFileParsesAllowedOrigins(t *testing.T) {
+	t.Setenv("TGNAS_SECRET_KEY", "secret")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	err := os.WriteFile(path, []byte(`
+server:
+  allowed_origins:
+    - https://global.example.com
+    - https://*.example.com
+    - /^https://[a-z]+\.internal\.example$/
+auth:
+  credentials:
+    - access_key: AKID
+      secret_key_env: TGNAS_SECRET_KEY
+telegram:
+  bot_token: 123456:valid-token
+metadata:
+  sqlite_path: metadata.sqlite
+buckets:
+  photos:
+    chat_id: "-100"
+    allowed_origins:
+      - https://photos.example.com
+`), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile returned error: %v", err)
+	}
+
+	wantGlobal := []string{
+		"https://global.example.com",
+		"https://*.example.com",
+		`/^https://[a-z]+\.internal\.example$/`,
+	}
+	if !reflect.DeepEqual(cfg.Server.AllowedOrigins, wantGlobal) {
+		t.Fatalf("server allowed origins = %#v, want %#v", cfg.Server.AllowedOrigins, wantGlobal)
+	}
+	wantBucket := []string{"https://photos.example.com"}
+	if !reflect.DeepEqual(cfg.Buckets["photos"].AllowedOrigins, wantBucket) {
+		t.Fatalf("bucket allowed origins = %#v, want %#v", cfg.Buckets["photos"].AllowedOrigins, wantBucket)
+	}
+}
+
+func TestLoadFileDefaultsAllowedOriginsToEmpty(t *testing.T) {
+	cfg := minimalValidConfig()
+	if len(cfg.Server.AllowedOrigins) != 0 {
+		t.Fatalf("server allowed origins = %#v, want empty", cfg.Server.AllowedOrigins)
+	}
+	if len(cfg.Buckets["photos"].AllowedOrigins) != 0 {
+		t.Fatalf("bucket allowed origins = %#v, want empty", cfg.Buckets["photos"].AllowedOrigins)
+	}
+}
 
 func TestLoadConfigDefaultsAndYAML(t *testing.T) {
 	dir := t.TempDir()

@@ -1779,3 +1779,188 @@ func signRequestForProxyTest(t *testing.T, request *http.Request) {
 		t.Fatalf("SignHTTP returned error: %v", err)
 	}
 }
+
+func TestS3CORSProductionWiring(t *testing.T) {
+	cfg := config.Config{
+		Server: config.ServerConfig{AllowedOrigins: []string{"https://global.example"}},
+		Auth:   config.AuthConfig{Region: "us-east-1"},
+		Buckets: map[string]config.BucketConfig{
+			"override":        {AllowedOrigins: []string{"https://bucket.example"}},
+			"fallback-empty":  {AllowedOrigins: []string{}},
+			"fallback-blanks": {AllowedOrigins: []string{"", ""}},
+		},
+	}
+	policy, err := compileCORSPolicyFromConfig(cfg)
+	if err != nil {
+		t.Fatalf("compileCORSPolicyFromConfig returned error: %v", err)
+	}
+	options := s3OptionsFromConfig(cfg, map[string]string{"AKID": "SECRET"}, func() bool { return true }, log.New(io.Discard, "", 0), policy)
+	server := s3api.NewServer(proxySigV4ObjectStore{}, options)
+
+	tests := []struct {
+		path   string
+		origin string
+		want   int
+	}{
+		{path: "/override/key", origin: "https://bucket.example", want: http.StatusNoContent},
+		{path: "/override/key", origin: "https://global.example", want: http.StatusForbidden},
+		{path: "/fallback-empty/key", origin: "https://global.example", want: http.StatusNoContent},
+		{path: "/fallback-blanks/key", origin: "https://global.example", want: http.StatusNoContent},
+		{path: "/", origin: "https://global.example", want: http.StatusNoContent},
+	}
+	for _, tc := range tests {
+		req := httptest.NewRequest(http.MethodOptions, tc.path, nil)
+		req.Header.Set("Origin", tc.origin)
+		req.Header.Set("Access-Control-Request-Method", "GET")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != tc.want {
+			t.Fatalf("%s from %s: status = %d, want %d", tc.path, tc.origin, rec.Code, tc.want)
+		}
+	}
+}
+
+func TestRunServiceRejectsInvalidCORSBeforeSideEffects(t *testing.T) {
+	t.Setenv("TGNAS_SECRET_KEY", "secret")
+	tests := []struct {
+		name       string
+		globalCORS string
+		bucketCORS string
+		wantText   string
+	}{
+		{name: "global", globalCORS: "  allowed_origins:\n    - /[invalid/\n", wantText: "global CORS policy"},
+		{name: "bucket", bucketCORS: "    allowed_origins:\n      - /[invalid/\n", wantText: `bucket "photos" CORS policy`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			sqlitePath := filepath.Join(dir, "metadata.sqlite")
+			configPath := filepath.Join(dir, "config.yaml")
+			contents := fmt.Sprintf(`
+server:
+  listen: :0
+%s
+auth:
+  credentials:
+    - access_key: AKID
+      secret_key_env: TGNAS_SECRET_KEY
+telegram:
+  bot_token: 123456:valid-token
+metadata:
+  sqlite_path: %s
+buckets:
+  photos:
+    chat_id: "-100"
+%s`, tc.globalCORS, strconv.Quote(sqlitePath), tc.bucketCORS)
+			if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			objectStoreCalled := false
+			oldNewObjectStore := newObjectStore
+			oldListenAndServe := listenAndServe
+			newObjectStore = func(metadata.Store, telegram.Client, store.Options) (*store.ObjectStore, error) {
+				objectStoreCalled = true
+				return nil, errors.New("unexpected object store construction")
+			}
+			listenAndServe = func(string, http.Handler) error {
+				t.Fatal("listenAndServe should not be called")
+				return nil
+			}
+			t.Cleanup(func() {
+				newObjectStore = oldNewObjectStore
+				listenAndServe = oldListenAndServe
+			})
+
+			err := runServiceWithDebug(configPath, serverModeS3, newDebugLogger(false, io.Discard))
+			if err == nil || !strings.Contains(err.Error(), tc.wantText) {
+				t.Fatalf("err = %v, want text %q", err, tc.wantText)
+			}
+			if objectStoreCalled {
+				t.Fatal("newObjectStore was called")
+			}
+			if _, statErr := os.Stat(sqlitePath); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("sqlite path stat error = %v, want not exist", statErr)
+			}
+		})
+	}
+}
+
+func TestCombinedHandlerDoesNotApplyS3CORSToWebDAV(t *testing.T) {
+	t.Setenv("TGNAS_SECRET_KEY", "secret")
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	sqlitePath := filepath.Join(dir, "metadata.sqlite")
+	contents := strings.Join([]string{
+		"server:",
+		"  listen: :0",
+		"  allowed_origins:",
+		"    - https://frontend.example",
+		"auth:",
+		"  credentials:",
+		"    - access_key: AKID",
+		"      secret_key_env: TGNAS_SECRET_KEY",
+		"telegram:",
+		"  bot_token: 123456:valid-token",
+		"metadata:",
+		"  sqlite_path: " + strconv.Quote(sqlitePath),
+		"buckets:",
+		"  photos:",
+		"    chat_id: \"-100\"",
+		"webdav:",
+		"  prefix: /dav/",
+		"",
+	}, "\n")
+	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var handler http.Handler
+	oldListenAndServe := listenAndServe
+	listenAndServe = func(_ string, h http.Handler) error {
+		handler = h
+		return nil
+	}
+	t.Cleanup(func() { listenAndServe = oldListenAndServe })
+	if err := runServiceWithDebug(configPath, serverModeAll, newDebugLogger(false, io.Discard)); err != nil {
+		t.Fatalf("runServiceWithDebug returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodOptions, "/dav/", nil)
+	req.Header.Set("Origin", "https://frontend.example")
+	req.Header.Set("Access-Control-Request-Method", "GET")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("WebDAV OPTIONS status = %d, want existing authentication status %d", rec.Code, http.StatusUnauthorized)
+	}
+	for _, name := range []string{
+		"Access-Control-Allow-Origin",
+		"Access-Control-Allow-Methods",
+		"Access-Control-Allow-Headers",
+		"Access-Control-Max-Age",
+		"Access-Control-Expose-Headers",
+	} {
+		if got := rec.Header().Get(name); got != "" {
+			t.Fatalf("WebDAV %s = %q, want absent", name, got)
+		}
+	}
+	for _, dimension := range []string{"Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers"} {
+		if varyTokenCountForMainTest(rec.Header(), dimension) != 0 {
+			t.Fatalf("WebDAV Vary = %#v, want no CORS dimension %s", rec.Header().Values("Vary"), dimension)
+		}
+	}
+}
+
+func varyTokenCountForMainTest(header http.Header, name string) int {
+	count := 0
+	for _, value := range header.Values("Vary") {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), name) {
+				count++
+			}
+		}
+	}
+	return count
+}

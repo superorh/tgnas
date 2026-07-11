@@ -1056,3 +1056,410 @@ func extractBetween(value, start, end string) string {
 	}
 	return value[from : from+to]
 }
+
+func mustCompileTestCORSPolicy(t *testing.T, global []string, buckets map[string][]string) *CORSPolicy {
+	t.Helper()
+	policy, err := CompileCORSPolicy(global, buckets)
+	if err != nil {
+		t.Fatalf("CompileCORSPolicy returned error: %v", err)
+	}
+	return policy
+}
+
+func newCORSTestServer(t *testing.T, policy *CORSPolicy, options func(*Options)) http.Handler {
+	t.Helper()
+	base := Options{
+		Region:      "us-east-1",
+		Credentials: map[string]string{"AKID": "SECRET"},
+		Ready:       func() bool { return true },
+		CORS:        policy,
+	}
+	if options != nil {
+		options(&base)
+	}
+	return NewServer(errorPutObjectStore{}, base)
+}
+
+func newPreflightRequest(path, origin, method, headers string) *http.Request {
+	req := httptest.NewRequest(http.MethodOptions, path, nil)
+	if origin != "" {
+		req.Header.Set("Origin", origin)
+	}
+	if method != "" {
+		req.Header.Set("Access-Control-Request-Method", method)
+	}
+	if headers != "" {
+		req.Header.Set("Access-Control-Request-Headers", headers)
+	}
+	return req
+}
+
+func varyTokenCount(header http.Header, name string) int {
+	count := 0
+	for _, value := range header.Values("Vary") {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), name) {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+func assertNoCORSNegotiationHeaders(t *testing.T, header http.Header) {
+	t.Helper()
+	for _, name := range []string{
+		"Access-Control-Allow-Origin",
+		"Access-Control-Allow-Methods",
+		"Access-Control-Allow-Headers",
+		"Access-Control-Max-Age",
+		"Access-Control-Expose-Headers",
+		"Access-Control-Allow-Credentials",
+	} {
+		if got := header.Get(name); got != "" {
+			t.Fatalf("%s = %q, want absent", name, got)
+		}
+	}
+}
+
+func TestCORSActualResponses(t *testing.T) {
+	policy := mustCompileTestCORSPolicy(t, []string{"https://frontend.example"}, nil)
+	server := newCORSTestServer(t, policy, nil)
+
+	tests := []struct {
+		name      string
+		origin    string
+		wantAllow bool
+		wantVary  bool
+	}{
+		{name: "allowed", origin: "https://frontend.example", wantAllow: true, wantVary: true},
+		{name: "denied", origin: "https://evil.example", wantVary: true},
+		{name: "missing origin", wantVary: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/photos/object", nil)
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			rec := httptest.NewRecorder()
+			server.ServeHTTP(rec, req)
+
+			if tc.wantVary && varyTokenCount(rec.Header(), "Origin") != 1 {
+				t.Fatalf("Vary = %#v, want Origin exactly once", rec.Header().Values("Vary"))
+			}
+			if tc.wantAllow {
+				if got := rec.Header().Get("Access-Control-Allow-Origin"); got != tc.origin {
+					t.Fatalf("allow origin = %q, want %q", got, tc.origin)
+				}
+				if got := rec.Header().Get("Access-Control-Expose-Headers"); got != "ETag, Content-Range, Content-Length, Accept-Ranges, Last-Modified" {
+					t.Fatalf("expose headers = %q", got)
+				}
+			} else if rec.Header().Get("Access-Control-Allow-Origin") != "" || rec.Header().Get("Access-Control-Expose-Headers") != "" {
+				t.Fatalf("unexpected CORS headers: %#v", rec.Header())
+			}
+			if rec.Header().Get("Access-Control-Allow-Credentials") != "" {
+				t.Fatal("Access-Control-Allow-Credentials must not be emitted")
+			}
+		})
+	}
+}
+
+func TestCORSDisabledPreservesExistingBehavior(t *testing.T) {
+	for _, policy := range []*CORSPolicy{nil, mustCompileTestCORSPolicy(t, nil, nil)} {
+		server := newCORSTestServer(t, policy, nil)
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, newPreflightRequest("/photos/object", "https://frontend.example", "GET", ""))
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want existing SigV4 rejection %d", rec.Code, http.StatusForbidden)
+		}
+		assertNoCORSNegotiationHeaders(t, rec.Header())
+		if varyTokenCount(rec.Header(), "Origin") != 0 {
+			t.Fatalf("Vary = %#v, want no CORS dimension", rec.Header().Values("Vary"))
+		}
+	}
+}
+
+func TestCORSPreflightNegotiation(t *testing.T) {
+	policy := mustCompileTestCORSPolicy(t, []string{"https://frontend.example"}, nil)
+	server := newCORSTestServer(t, policy, nil)
+
+	tests := []struct {
+		name    string
+		origin  string
+		method  string
+		headers string
+		want    int
+	}{
+		{name: "allowed", origin: "https://frontend.example", method: "put", headers: "authorization, Content-Type, range, X-Amz-Date, X-Amz-Content-Sha256", want: http.StatusNoContent},
+		{name: "denied origin", origin: "https://evil.example", method: "GET", want: http.StatusForbidden},
+		{name: "denied method", origin: "https://frontend.example", method: "PATCH", want: http.StatusForbidden},
+		{name: "denied header", origin: "https://frontend.example", method: "GET", headers: "X-Custom", want: http.StatusForbidden},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			server.ServeHTTP(rec, newPreflightRequest("/photos/object", tc.origin, tc.method, tc.headers))
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.want)
+			}
+			for _, dimension := range []string{"Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers"} {
+				if varyTokenCount(rec.Header(), dimension) != 1 {
+					t.Fatalf("Vary = %#v, want %s exactly once", rec.Header().Values("Vary"), dimension)
+				}
+			}
+			if tc.want == http.StatusNoContent {
+				if rec.Header().Get("Access-Control-Allow-Origin") != tc.origin ||
+					rec.Header().Get("Access-Control-Allow-Methods") != "GET, HEAD, PUT, POST, DELETE, OPTIONS" ||
+					rec.Header().Get("Access-Control-Allow-Headers") != "Authorization, Content-Type, Range, X-Amz-Date, X-Amz-Content-Sha256" ||
+					rec.Header().Get("Access-Control-Max-Age") != "3600" {
+					t.Fatalf("unexpected preflight headers: %#v", rec.Header())
+				}
+				if rec.Header().Get("Access-Control-Expose-Headers") != "" {
+					t.Fatal("preflight must not expose actual-response headers")
+				}
+				if rec.Header().Get("Access-Control-Allow-Credentials") != "" {
+					t.Fatal("preflight must not allow credentials")
+				}
+			} else {
+				assertNoCORSNegotiationHeaders(t, rec.Header())
+			}
+		})
+	}
+}
+
+func TestCORSOptionsMissingPreflightFieldsContinuesThroughSigV4(t *testing.T) {
+	policy := mustCompileTestCORSPolicy(t, []string{"https://frontend.example"}, nil)
+	server := newCORSTestServer(t, policy, nil)
+
+	tests := []struct {
+		name            string
+		req             *http.Request
+		wantStatus      int
+		wantOriginVary  int
+		wantAllowOrigin string
+		wantExpose      bool
+	}{
+		{
+			name:            "missing request method keeps actual decoration and fails SigV4",
+			req:             newPreflightRequest("/photos/object", "https://frontend.example", "", ""),
+			wantStatus:      http.StatusForbidden,
+			wantOriginVary:  1,
+			wantAllowOrigin: "https://frontend.example",
+			wantExpose:      true,
+		},
+		{
+			name:           "missing origin continues through SigV4 with Origin Vary",
+			req:            newPreflightRequest("/photos/object", "", "GET", ""),
+			wantStatus:     http.StatusForbidden,
+			wantOriginVary: 1,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			server.ServeHTTP(rec, tc.req)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.wantStatus)
+			}
+			if varyTokenCount(rec.Header(), "Origin") != tc.wantOriginVary {
+				t.Fatalf("Vary Origin count = %d, want %d; values = %#v", varyTokenCount(rec.Header(), "Origin"), tc.wantOriginVary, rec.Header().Values("Vary"))
+			}
+			if got := rec.Header().Get("Access-Control-Allow-Origin"); got != tc.wantAllowOrigin {
+				t.Fatalf("Access-Control-Allow-Origin = %q, want %q", got, tc.wantAllowOrigin)
+			}
+			if got := rec.Header().Get("Access-Control-Expose-Headers"); (got != "") != tc.wantExpose {
+				t.Fatalf("Access-Control-Expose-Headers = %q, want present %v", got, tc.wantExpose)
+			}
+			if tc.wantExpose && rec.Header().Get("Access-Control-Expose-Headers") != corsExposeHeaders {
+				t.Fatalf("Access-Control-Expose-Headers = %q, want %q", rec.Header().Get("Access-Control-Expose-Headers"), corsExposeHeaders)
+			}
+			if varyTokenCount(rec.Header(), "Access-Control-Request-Method") != 0 || varyTokenCount(rec.Header(), "Access-Control-Request-Headers") != 0 {
+				t.Fatalf("unrecognized preflight got negotiation Vary: %#v", rec.Header().Values("Vary"))
+			}
+		})
+	}
+}
+
+func TestCORSBucketOverrideAndFallbackHTTP(t *testing.T) {
+	policy := mustCompileTestCORSPolicy(t,
+		[]string{"https://global.example"},
+		map[string][]string{
+			"override":        {"https://bucket.example"},
+			"fallback-empty":  {},
+			"fallback-blanks": {"", ""},
+		},
+	)
+	server := newCORSTestServer(t, policy, nil)
+
+	tests := []struct {
+		path   string
+		origin string
+		want   int
+	}{
+		{path: "/override/key", origin: "https://bucket.example", want: http.StatusNoContent},
+		{path: "/override/key", origin: "https://global.example", want: http.StatusForbidden},
+		{path: "/fallback-empty/key", origin: "https://global.example", want: http.StatusNoContent},
+		{path: "/fallback-blanks/key", origin: "https://global.example", want: http.StatusNoContent},
+		{path: "/absent/key", origin: "https://global.example", want: http.StatusNoContent},
+		{path: "/", origin: "https://global.example", want: http.StatusNoContent},
+	}
+	for _, tc := range tests {
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, newPreflightRequest(tc.path, tc.origin, "GET", ""))
+		if rec.Code != tc.want {
+			t.Fatalf("%s from %s: status = %d, want %d", tc.path, tc.origin, rec.Code, tc.want)
+		}
+	}
+}
+
+func TestCORSExcludesHealthAndReadiness(t *testing.T) {
+	policy := mustCompileTestCORSPolicy(t, []string{"https://frontend.example"}, nil)
+	tests := []struct {
+		name     string
+		ready    bool
+		path     string
+		wantCode int
+		wantBody string
+	}{
+		{name: "health ready", ready: true, path: "/healthz", wantCode: http.StatusOK, wantBody: "ok"},
+		{name: "health not ready", ready: false, path: "/healthz", wantCode: http.StatusOK, wantBody: "ok"},
+		{name: "ready", ready: true, path: "/readyz", wantCode: http.StatusOK, wantBody: "ready"},
+		{name: "not ready", ready: false, path: "/readyz", wantCode: http.StatusServiceUnavailable, wantBody: "not ready"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newCORSTestServer(t, policy, func(options *Options) {
+				options.Ready = func() bool { return tc.ready }
+			})
+
+			get := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			get.Header.Set("Origin", "https://frontend.example")
+			getRec := httptest.NewRecorder()
+			server.ServeHTTP(getRec, get)
+			if getRec.Code != tc.wantCode || getRec.Body.String() != tc.wantBody {
+				t.Fatalf("GET %s status = %d body = %q, want %d %q", tc.path, getRec.Code, getRec.Body.String(), tc.wantCode, tc.wantBody)
+			}
+			assertNoCORSNegotiationHeaders(t, getRec.Header())
+			for _, dimension := range []string{"Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers"} {
+				if varyTokenCount(getRec.Header(), dimension) != 0 {
+					t.Fatalf("GET %s Vary = %#v, want no CORS dimensions", tc.path, getRec.Header().Values("Vary"))
+				}
+			}
+
+			preflightRec := httptest.NewRecorder()
+			server.ServeHTTP(preflightRec, newPreflightRequest(tc.path, "https://frontend.example", "GET", ""))
+			if preflightRec.Code != http.StatusNotFound {
+				t.Fatalf("OPTIONS %s status = %d, want 404", tc.path, preflightRec.Code)
+			}
+			assertNoCORSNegotiationHeaders(t, preflightRec.Header())
+			for _, dimension := range []string{"Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers"} {
+				if varyTokenCount(preflightRec.Header(), dimension) != 0 {
+					t.Fatalf("OPTIONS %s Vary = %#v, want no CORS dimensions", tc.path, preflightRec.Header().Values("Vary"))
+				}
+			}
+		})
+	}
+}
+
+func TestCORSVaryPreservesExistingValues(t *testing.T) {
+	policy := mustCompileTestCORSPolicy(t, []string{"https://frontend.example"}, nil)
+	inner := newCORSTestServer(t, policy, nil)
+	server := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Vary", "Accept-Encoding, origin")
+		w.Header().Add("Vary", "User-Agent")
+		inner.ServeHTTP(w, r)
+	})
+
+	for _, req := range []*http.Request{
+		httptest.NewRequest(http.MethodGet, "/photos/key", nil),
+		newPreflightRequest("/photos/key", "https://frontend.example", "GET", "Authorization"),
+	} {
+		req.Header.Set("Origin", "https://frontend.example")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if varyTokenCount(rec.Header(), "Accept-Encoding") != 1 || varyTokenCount(rec.Header(), "User-Agent") != 1 || varyTokenCount(rec.Header(), "Origin") != 1 {
+			t.Fatalf("Vary values not preserved/deduplicated: %#v", rec.Header().Values("Vary"))
+		}
+		if req.Method == http.MethodOptions {
+			if varyTokenCount(rec.Header(), "Access-Control-Request-Method") != 1 || varyTokenCount(rec.Header(), "Access-Control-Request-Headers") != 1 {
+				t.Fatalf("preflight Vary dimensions = %#v, want each negotiation dimension once", rec.Header().Values("Vary"))
+			}
+		}
+	}
+}
+
+func newPublicReadCORSTestServer(t *testing.T, publicReadBuckets map[string]bool, policy *CORSPolicy) http.Handler {
+	t.Helper()
+	ctx := context.Background()
+	meta, err := metadata.OpenSQLite(filepath.Join(t.TempDir(), "metadata.sqlite"))
+	if err != nil {
+		t.Fatalf("OpenSQLite returned error: %v", err)
+	}
+	t.Cleanup(func() { _ = meta.Close() })
+	for name, chatID := range map[string]string{"photos": "-100", "backups": "-200"} {
+		if err := meta.UpsertBucket(ctx, metadata.Bucket{Name: name, ChatID: chatID, CreatedAt: time.Now().UTC(), Enabled: true}); err != nil {
+			t.Fatalf("UpsertBucket(%s) returned error: %v", name, err)
+		}
+	}
+	objectStore, err := store.NewObjectStore(meta, testutil.NewFakeTelegram(), store.Options{Upload: store.DefaultUploadConfig()})
+	if err != nil {
+		t.Fatalf("NewObjectStore returned error: %v", err)
+	}
+	return NewServer(objectStore, Options{
+		Region:            "us-east-1",
+		Credentials:       map[string]string{"AKID": "SECRET"},
+		PublicReadBuckets: publicReadBuckets,
+		SigV4Clock:        func() time.Time { return time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC) },
+		Ready:             func() bool { return true },
+		CORS:              policy,
+	})
+}
+
+func TestCORSPublicReadRetainsAnonymousBehavior(t *testing.T) {
+	policy := mustCompileTestCORSPolicy(t, []string{"https://frontend.example"}, nil)
+	server := newPublicReadCORSTestServer(t, map[string]bool{"photos": true}, policy)
+
+	put := signedRecorderRequest(t, http.MethodPut, "/photos/public.txt", "hello", map[string]string{"Content-Type": "text/plain"})
+	server.ServeHTTP(put.recorder, put.request)
+	if put.recorder.Code != http.StatusOK {
+		t.Fatalf("put status = %d body = %s", put.recorder.Code, put.recorder.Body.String())
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/photos/public.txt", nil)
+	req.Header.Set("Origin", "https://frontend.example")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "hello" {
+		t.Fatalf("anonymous get status = %d body = %q", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Access-Control-Allow-Origin") != "https://frontend.example" ||
+		rec.Header().Get("Access-Control-Expose-Headers") != corsExposeHeaders ||
+		varyTokenCount(rec.Header(), "Origin") != 1 {
+		t.Fatalf("anonymous CORS headers = %#v", rec.Header())
+	}
+}
+
+func TestCORSBusinessErrorRetainsActualResponseHeaders(t *testing.T) {
+	policy := mustCompileTestCORSPolicy(t, []string{"https://frontend.example"}, nil)
+	server := NewServer(errorPutObjectStore{err: errors.New("upload failed")}, Options{
+		Region:      "us-east-1",
+		Credentials: map[string]string{"AKID": "SECRET"},
+		Ready:       func() bool { return true },
+		SigV4Clock:  func() time.Time { return time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC) },
+		CORS:        policy,
+	})
+	put := signedUnsignedPayloadRecorderRequest(t, http.MethodPut, "/photos/fail.txt", "hello", map[string]string{
+		"Content-Type": "text/plain",
+		"Origin":       "https://frontend.example",
+	})
+	server.ServeHTTP(put.recorder, put.request)
+	if put.recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("put status = %d body = %s", put.recorder.Code, put.recorder.Body.String())
+	}
+	if put.recorder.Header().Get("Access-Control-Allow-Origin") != "https://frontend.example" ||
+		put.recorder.Header().Get("Access-Control-Expose-Headers") != corsExposeHeaders ||
+		varyTokenCount(put.recorder.Header(), "Origin") != 1 {
+		t.Fatalf("business-error CORS headers = %#v", put.recorder.Header())
+	}
+}

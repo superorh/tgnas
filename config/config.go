@@ -43,6 +43,7 @@ type ServerConfig struct {
 	PublicBaseURL     string   `yaml:"public_base_url"`
 	TrustedProxies    []string `yaml:"trusted_proxies"`
 	TrustedProxyHosts []string `yaml:"trusted_proxy_hosts"`
+	AllowedOrigins    []string `yaml:"allowed_origins"`
 }
 
 type AuthConfig struct {
@@ -83,9 +84,10 @@ type StorageConfig struct {
 }
 
 type BucketConfig struct {
-	ChatID     string `yaml:"chat_id"`
-	BotToken   string `yaml:"bot_token"`
-	PublicRead bool   `yaml:"public_read"`
+	ChatID         string   `yaml:"chat_id"`
+	BotToken       string   `yaml:"bot_token"`
+	PublicRead     bool     `yaml:"public_read"`
+	AllowedOrigins []string `yaml:"allowed_origins"`
 }
 
 type WebDAVConfig struct {
