@@ -1038,7 +1038,14 @@ func signRequest(t *testing.T, request *http.Request, accessKey, secret string) 
 	request.Header.Del("Authorization")
 	request.Header.Del("X-Amz-Date")
 	credentials := aws.Credentials{AccessKeyID: accessKey, SecretAccessKey: secret}
-	err := v4.NewSigner().SignHTTP(context.Background(), credentials, request, payloadHash, "s3", "us-east-1", time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC))
+	// DisableURIPathEscaping matches real S3 clients (aws-cli, mc, rclone):
+	// unlike most AWS services' generic SigV4 signing, S3 does not
+	// double-escape an already-percent-encoded path when building the
+	// canonical request. See the same note in sigv4_test.go's
+	// signedTestRequest.
+	err := v4.NewSigner().SignHTTP(context.Background(), credentials, request, payloadHash, "s3", "us-east-1", time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC), func(o *v4.SignerOptions) {
+		o.DisableURIPathEscaping = true
+	})
 	if err != nil {
 		t.Fatalf("SignHTTP returned error: %v", err)
 	}

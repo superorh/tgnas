@@ -116,6 +116,31 @@ func TestVerifySigV4SignedByAWSSDK(t *testing.T) {
 	}
 }
 
+func TestVerifySigV4SignedByAWSSDKNonASCIIPath(t *testing.T) {
+	// Regression test: canonicalURI used to call u.EscapedPath() (which
+	// already percent-encodes non-ASCII UTF-8 bytes) and then re-encode the
+	// result byte-by-byte, double-encoding the literal "%" characters and
+	// diverging from what a spec-compliant SigV4 client (e.g. rclone,
+	// tested here via the real AWS SDK signer) computes. This broke every
+	// object key containing accented letters, curly quotes, etc. with a
+	// SignatureDoesNotMatch/Forbidden error.
+	request := signedTestRequest(t, signedRequestOptions{
+		accessKey: "AKID",
+		secret:    "SECRET",
+		region:    "us-east-1",
+		service:   "s3",
+		target:    "https://example.com/immich-library/Capture%20d%E2%80%99%C3%A9cran.png",
+	})
+	verifier := NewSigV4Verifier("us-east-1", map[string]string{"AKID": "SECRET"}, WithSigV4Clock(func() time.Time { return time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC) }))
+	identity, err := verifier.Verify(request)
+	if err != nil {
+		t.Fatalf("Verify returned error: %v", err)
+	}
+	if identity.AccessKey != "AKID" {
+		t.Fatalf("identity = %+v", identity)
+	}
+}
+
 func TestVerifySigV4ListBucketsSignedByAWSSDK(t *testing.T) {
 	request := signedTestRequest(t, signedRequestOptions{accessKey: "AKID", secret: "SECRET", region: "us-east-1", service: "s3", target: "https://s3.example.com/?x-id=ListBuckets"})
 	verifier := NewSigV4Verifier("us-east-1", map[string]string{"AKID": "SECRET"}, WithSigV4Clock(func() time.Time { return time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC) }))
@@ -572,7 +597,14 @@ func signedTestRequest(t *testing.T, opts signedRequestOptions) *http.Request {
 	}
 	request.Header.Set("X-Amz-Content-Sha256", payloadHash)
 	credentials := aws.Credentials{AccessKeyID: opts.accessKey, SecretAccessKey: opts.secret}
-	err := v4.NewSigner().SignHTTP(context.Background(), credentials, request, payloadHash, opts.service, opts.region, time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC))
+	// DisableURIPathEscaping matches real S3 clients (aws-cli, mc, rclone):
+	// unlike most AWS services' generic SigV4 signing, S3 does not
+	// double-escape an already-percent-encoded path when building the
+	// canonical request. Without this, this helper silently reproduced the
+	// same double-encoding bug canonicalURI used to have, masking it.
+	err := v4.NewSigner().SignHTTP(context.Background(), credentials, request, payloadHash, opts.service, opts.region, time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC), func(o *v4.SignerOptions) {
+		o.DisableURIPathEscaping = true
+	})
 	if err != nil {
 		t.Fatalf("SignHTTP returned error: %v", err)
 	}
