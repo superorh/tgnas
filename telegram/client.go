@@ -560,7 +560,28 @@ func uploadedFileFromResult(fileType string, result uploadResult) (UploadedFile,
 	case TypeAnimation:
 		return mediaToUploadedFile("animation", result.Animation)
 	case TypeDocument:
-		return mediaToUploadedFile("document", result.Document)
+		if uploaded, err := mediaToUploadedFile("document", result.Document); err == nil {
+			return uploaded, nil
+		}
+		// Telegram can reclassify a document upload into a different
+		// response field even when sendDocument was the API called to
+		// upload it — observed in production for certain mp4 videos, where
+		// the response's "document" field was empty but "video" was
+		// populated. Fall back to whichever field Telegram actually filled
+		// in rather than failing an upload that genuinely succeeded.
+		for _, fallback := range [...]struct {
+			name  string
+			media telegramFile
+		}{
+			{"video", result.Video},
+			{"animation", result.Animation},
+			{"audio", result.Audio},
+		} {
+			if fallback.media.FileID != "" {
+				return mediaToUploadedFile(fallback.name, fallback.media)
+			}
+		}
+		return UploadedFile{}, errors.New("telegram upload response missing document")
 	default:
 		return UploadedFile{}, fmt.Errorf("unsupported telegram upload type %q", fileType)
 	}
