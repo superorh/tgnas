@@ -39,6 +39,45 @@ func TestClientUploadDocumentSendsCaptionAndParsesFile(t *testing.T) {
 	}
 }
 
+// TestClientUploadDocumentFallsBackToVideoField guards against a real
+// production incident (2026-07-14): Telegram reclassified certain mp4
+// uploads sent via sendDocument, returning the "video" field populated and
+// "document" empty — tgnas only checked "document" and failed the upload
+// outright even though it genuinely succeeded on Telegram's side.
+func TestClientUploadDocumentFallsBackToVideoField(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":77,"document":{},"video":{"file_id":"video-file-1","file_unique_id":"video-unique-1","file_size":150377,"mime_type":"video/mp4"}}}`))
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient("token", server.URL, http.DefaultClient)
+	uploaded, err := client.Upload(context.Background(), UploadRequest{Type: TypeDocument, ChatID: "-100", Reader: strings.NewReader("fake video bytes"), Filename: "1000044311.mp4"})
+	if err != nil {
+		t.Fatalf("Upload returned error: %v", err)
+	}
+	if uploaded.FileID != "video-file-1" || uploaded.MessageID != 77 || uploaded.FileSize != 150377 {
+		t.Fatalf("uploaded = %+v", uploaded)
+	}
+}
+
+// TestClientUploadDocumentFailsWhenNoFieldPopulated confirms the fallback
+// doesn't mask a genuine failure — if Telegram's response has no usable
+// media field at all, Upload must still return an error.
+func TestClientUploadDocumentFailsWhenNoFieldPopulated(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":77,"document":{}}}`))
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient("token", server.URL, http.DefaultClient)
+	_, err := client.Upload(context.Background(), UploadRequest{Type: TypeDocument, ChatID: "-100", Reader: strings.NewReader("hello"), Filename: "hello.txt"})
+	if err == nil {
+		t.Fatal("expected an error when no media field is populated, got nil")
+	}
+}
+
 func TestClientUploadPhotoUsesPhotoEndpointAndLargestPhoto(t *testing.T) {
 	var path string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
