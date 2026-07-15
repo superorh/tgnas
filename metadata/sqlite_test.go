@@ -2,9 +2,11 @@ package metadata
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 )
@@ -421,6 +423,58 @@ func TestSQLiteDeleteAndMissingObject(t *testing.T) {
 	_, err = store.HeadObject(t.Context(), "photos", "gone.txt")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("HeadObject after delete error = %v, want ErrNotFound", err)
+	}
+}
+
+// TestSQLiteConcurrentAccessDoesNotFailWithDatabaseLocked reproduces a
+// production incident (2026-07-15, a bulk rename of ~1000 files): without
+// a busy_timeout/WAL pragma and with more than one open connection to the
+// same file, concurrent reads and writes returned "database is locked"
+// (SQLITE_BUSY) immediately instead of queueing behind whichever
+// connection held the lock. OpenSQLite now sets both, plus
+// SetMaxOpenConns(1) to serialize access through this *sql.DB.
+func TestSQLiteConcurrentAccessDoesNotFailWithDatabaseLocked(t *testing.T) {
+	store := openTestSQLiteStore(t)
+	defer store.Close()
+
+	const workers = 50
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			key := fmt.Sprintf("concurrent-%d.txt", i)
+			object := Object{
+				Bucket:         "photos",
+				Key:            key,
+				Size:           1,
+				ContentType:    "text/plain",
+				ETag:           "etag",
+				SHA256:         "sha",
+				LastModified:   time.Unix(int64(i), 0),
+				ChunkCount:     1,
+				TelegramType:   "document",
+				UploadStrategy: "document",
+			}
+			if err := store.PutObject(t.Context(), object, []Chunk{singleChunk("photos", key)}); err != nil {
+				errCh <- fmt.Errorf("PutObject %s: %w", key, err)
+				return
+			}
+			if _, err := store.HeadObject(t.Context(), "photos", key); err != nil {
+				errCh <- fmt.Errorf("HeadObject %s: %w", key, err)
+				return
+			}
+			if _, _, err := store.GetObject(t.Context(), "photos", key); err != nil {
+				errCh <- fmt.Errorf("GetObject %s: %w", key, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Errorf("concurrent access failed (want none, even under contention): %v", err)
 	}
 }
 

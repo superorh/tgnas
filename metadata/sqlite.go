@@ -18,10 +18,27 @@ type SQLiteStore struct {
 }
 
 func OpenSQLite(path string) (*SQLiteStore, error) {
-	store, err := openSQLite(path)
+	absolutePath, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
 	}
+	store, err := openSQLite(sqliteReadWriteDSN(absolutePath))
+	if err != nil {
+		return nil, err
+	}
+	// SQLite allows exactly one writer at a time no matter how many
+	// database/sql connections point at the file — without this,
+	// Go opens as many concurrent connections as there are simultaneous
+	// callers, and every one past the first contends for the same lock.
+	// Confirmed in production 2026-07-15: a bulk rename (~1000 requests
+	// in flight) made even plain reads (StatObject) fail immediately with
+	// a bare "500 Internal Server Error" (SQLITE_BUSY with no
+	// busy_timeout configured, so no retry). Forcing a single connection
+	// serializes access through this *sql.DB instead, and the
+	// busy_timeout/WAL pragmas below give any request that does queue up
+	// behind another a real chance to succeed rather than failing
+	// instantly.
+	store.db.SetMaxOpenConns(1)
 	if err := store.migrate(); err != nil {
 		_ = store.Close()
 		return nil, err
@@ -47,6 +64,22 @@ func openSQLite(dataSourceName string) (*SQLiteStore, error) {
 		return nil, err
 	}
 	return &SQLiteStore{db: db}, nil
+}
+
+// sqliteReadWriteDSN enables WAL journaling (reads no longer block behind
+// an in-progress write — SQLite's default rollback-journal mode takes an
+// exclusive lock across the whole file for any write) and a busy_timeout
+// (any access that still can't acquire the lock it needs waits up to 10s
+// and retries internally instead of failing immediately with
+// SQLITE_BUSY). See OpenSQLite's SetMaxOpenConns(1) comment for the
+// production incident this pair of pragmas fixes.
+func sqliteReadWriteDSN(path string) string {
+	u := url.URL{Scheme: "file", Path: path}
+	query := u.Query()
+	query.Add("_pragma", "busy_timeout(10000)")
+	query.Add("_pragma", "journal_mode(WAL)")
+	u.RawQuery = query.Encode()
+	return u.String()
 }
 
 func sqliteReadOnlyDSN(path string) string {
