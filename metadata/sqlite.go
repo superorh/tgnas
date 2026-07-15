@@ -26,19 +26,20 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	// SQLite allows exactly one writer at a time no matter how many
-	// database/sql connections point at the file — without this,
-	// Go opens as many concurrent connections as there are simultaneous
-	// callers, and every one past the first contends for the same lock.
-	// Confirmed in production 2026-07-15: a bulk rename (~1000 requests
-	// in flight) made even plain reads (StatObject) fail immediately with
-	// a bare "500 Internal Server Error" (SQLITE_BUSY with no
-	// busy_timeout configured, so no retry). Forcing a single connection
-	// serializes access through this *sql.DB instead, and the
-	// busy_timeout/WAL pragmas below give any request that does queue up
-	// behind another a real chance to succeed rather than failing
-	// instantly.
-	store.db.SetMaxOpenConns(1)
+	// A first fix attempt also called store.db.SetMaxOpenConns(1) here.
+	// Reverted 2026-07-15 (same incident, same day): forcing every access
+	// — including plain reads, which WAL already lets proceed without
+	// blocking on a writer — through one connection turned a bulk rename
+	// (~1000 requests in flight) into a deep queue behind that single
+	// connection, and requests waiting long enough in that queue started
+	// getting their underlying connection dropped (surfaced to callers as
+	// a bare EOF, no timeout/deadline error — nothing in this codebase or
+	// Go's default http.Server sets one, so something else in the path,
+	// e.g. an idle-connection reaper, was the one giving up). WAL +
+	// busy_timeout below already solve the original problem — SQLite
+	// itself only ever needed to serialize writer-vs-writer, and
+	// busy_timeout(10000) makes it wait and retry instead of failing
+	// instantly — without also serializing every reader behind them.
 	if err := store.migrate(); err != nil {
 		_ = store.Close()
 		return nil, err
