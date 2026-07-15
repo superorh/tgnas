@@ -115,6 +115,7 @@ func NewObjectStore(meta metadata.Store, tg telegram.Client, options Options) (*
 		}
 	}
 	options.Upload = upload
+	log.Printf("DIAG: resolved upload config: strategy=%q enable_chunking=%v max_file_size=%d chunk_size=%d type_limits=%v", upload.Strategy, upload.EnableChunking, upload.MaxFileSize, upload.ChunkSize, upload.TypeLimits)
 
 	store := &ObjectStore{
 		meta:               meta,
