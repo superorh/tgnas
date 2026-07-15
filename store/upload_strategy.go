@@ -1,7 +1,6 @@
 package store
 
 import (
-	"log"
 	"path/filepath"
 	"strings"
 )
@@ -52,7 +51,6 @@ func (r *UploadStrategyResolver) resolveAuto(filename, contentType string, size 
 
 func (r *UploadStrategyResolver) resolveDocument(size int64) (UploadStrategy, error) {
 	documentLimit := r.config.TypeLimits["document"]
-	log.Printf("DIAG: resolveDocument size=%d document_limit=%d type_limits=%v", size, documentLimit, r.config.TypeLimits)
 	if withinLimit(size, documentLimit) {
 		return UploadStrategy{TelegramType: "document", UploadStrategy: "document"}, nil
 	}
