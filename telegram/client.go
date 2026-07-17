@@ -6,11 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
 	"net/url"
+	"os"
 	"path"
 	"strconv"
 	"strings"
@@ -105,16 +105,12 @@ func (c *HTTPClient) Download(ctx context.Context, fileID string) (io.ReadCloser
 	values := url.Values{}
 	values.Set("file_id", fileID)
 
-	requestURL := c.methodURL("getFile")
-	log.Printf("debug event=telegram_get_file_request url=%q api_base_url=%q token_len=%d file_id=%q", requestURL, c.apiBaseURL, len(c.botToken), fileID)
-	resp, err := c.doJSONRequest(ctx, http.MethodPost, requestURL, "application/x-www-form-urlencoded", func() (io.ReadCloser, string, error) {
+	resp, err := c.doJSONRequest(ctx, http.MethodPost, c.methodURL("getFile"), "application/x-www-form-urlencoded", func() (io.ReadCloser, string, error) {
 		return io.NopCloser(strings.NewReader(values.Encode())), "application/x-www-form-urlencoded", nil
 	})
 	if err != nil {
-		log.Printf("debug event=telegram_get_file_result url=%q result=error stage=request error=%q", requestURL, err)
 		return nil, err
 	}
-	log.Printf("debug event=telegram_get_file_raw_response url=%q body=%q", requestURL, string(resp))
 
 	var envelope getFileEnvelope
 	if err := json.Unmarshal(resp, &envelope); err != nil {
@@ -125,6 +121,24 @@ func (c *HTTPClient) Download(ctx context.Context, fileID string) (io.ReadCloser
 	}
 	if envelope.Result.FilePath == "" {
 		return nil, errors.New("telegram getFile response missing file_path")
+	}
+
+	// In --local mode, the Bot API server returns an absolute path on its
+	// own filesystem instead of a relative one meant for the /file/ HTTP
+	// endpoint - confirmed against a real deployment: with --local, that
+	// endpoint 404s regardless of what's appended to it (both the raw
+	// absolute path and just its relative suffix), because --local shifts
+	// file access to direct disk reads instead of HTTP serving. Without
+	// --local, the server never populates a files_directory at all (per
+	// its own tdlibParameters), so nothing is servable through /file/
+	// either - --local plus a filesystem shared with the Bot API server's
+	// working directory is the only combination that actually works.
+	if strings.HasPrefix(envelope.Result.FilePath, "/") {
+		file, err := os.Open(envelope.Result.FilePath)
+		if err != nil {
+			return nil, fmt.Errorf("open local telegram file: %w", err)
+		}
+		return file, nil
 	}
 
 	return c.downloadFile(ctx, envelope.Result.FilePath)

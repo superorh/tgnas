@@ -2,10 +2,13 @@ package telegram
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -126,6 +129,55 @@ func TestClientDownloadStreamUsesGetFilePath(t *testing.T) {
 		t.Fatalf("ReadAll returned error: %v", err)
 	}
 	if string(data) != "hello" {
+		t.Fatalf("data = %q", string(data))
+	}
+}
+
+func TestClientDownloadReadsLocalFileWhenPathIsAbsolute(t *testing.T) {
+	dir := t.TempDir()
+	localPath := filepath.Join(dir, "file_1.txt")
+	if err := os.WriteFile(localPath, []byte("hello local"), 0o600); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/bottoken/getFile":
+			mustDrainBody(t, w, r)
+			w.Header().Set("Content-Type", "application/json")
+			body, err := json.Marshal(map[string]any{
+				"ok": true,
+				"result": map[string]any{
+					"file_id":   "file-1",
+					"file_path": localPath,
+					"file_size": 11,
+				},
+			})
+			if err != nil {
+				t.Fatalf("Marshal returned error: %v", err)
+			}
+			_, _ = w.Write(body)
+		default:
+			// --local mode never actually serves content through /file/ -
+			// if Download fell back to an HTTP request instead of reading
+			// the absolute path directly off disk, this failure below
+			// would be reached instead of returning "hello local".
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient("token", server.URL, http.DefaultClient)
+	stream, err := client.Download(context.Background(), "file-1")
+	if err != nil {
+		t.Fatalf("Download returned error: %v", err)
+	}
+	defer stream.Close()
+	data, err := io.ReadAll(stream)
+	if err != nil {
+		t.Fatalf("ReadAll returned error: %v", err)
+	}
+	if string(data) != "hello local" {
 		t.Fatalf("data = %q", string(data))
 	}
 }
