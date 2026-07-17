@@ -631,6 +631,7 @@ func (s *ObjectStore) GetObject(ctx context.Context, input GetObjectInput) (io.R
 	} else {
 		selected = SelectChunksForRange(chunkRefsFromMetadata(chunks), *input.Range)
 	}
+	s.logger.Printf("debug event=get_object_decision bucket=%q key=%q size=%d chunk_count=%d", input.Bucket, input.Key, info.Size, len(selected))
 
 	releaseDownload := s.acquire(ctx, s.downloads)
 	if releaseDownload == nil {
@@ -645,12 +646,14 @@ func (s *ObjectStore) GetObject(ctx context.Context, input GetObjectInput) (io.R
 		defer pw.Close()
 		binding, err := s.bucketBinding(input.Bucket)
 		if err != nil {
+			s.logger.Printf("debug event=get_object_stream bucket=%q key=%q result=error stage=binding error=%q", input.Bucket, input.Key, sanitizeLogError(err))
 			_ = pw.CloseWithError(err)
 			return
 		}
 		for _, chunk := range selected {
 			reader, err := s.downloadChunk(ctx, binding, chunk.FileID)
 			if err != nil {
+				s.logger.Printf("debug event=get_object_stream bucket=%q key=%q part=%d file_id=%q result=error stage=download error=%q", input.Bucket, input.Key, chunk.Part, chunk.FileID, sanitizeLogError(err))
 				_ = pw.CloseWithError(err)
 				return
 			}
@@ -660,6 +663,7 @@ func (s *ObjectStore) GetObject(ctx context.Context, input GetObjectInput) (io.R
 				source = io.LimitReader(source, chunk.Skip)
 				if _, err := io.Copy(io.Discard, source); err != nil {
 					_ = reader.Close()
+					s.logger.Printf("debug event=get_object_stream bucket=%q key=%q part=%d result=error stage=skip error=%q", input.Bucket, input.Key, chunk.Part, sanitizeLogError(err))
 					_ = pw.CloseWithError(err)
 					return
 				}
@@ -668,12 +672,16 @@ func (s *ObjectStore) GetObject(ctx context.Context, input GetObjectInput) (io.R
 			if chunk.Take >= 0 {
 				source = io.LimitReader(source, chunk.Take)
 			}
-			if _, err := io.Copy(pw, source); err != nil {
+			written, err := io.Copy(pw, source)
+			if err != nil {
 				_ = reader.Close()
+				s.logger.Printf("debug event=get_object_stream bucket=%q key=%q part=%d written=%d take=%d result=error stage=copy error=%q", input.Bucket, input.Key, chunk.Part, written, chunk.Take, sanitizeLogError(err))
 				_ = pw.CloseWithError(err)
 				return
 			}
+			s.logger.Printf("debug event=get_object_stream bucket=%q key=%q part=%d written=%d take=%d result=success", input.Bucket, input.Key, chunk.Part, written, chunk.Take)
 			if err := reader.Close(); err != nil {
+				s.logger.Printf("debug event=get_object_stream bucket=%q key=%q part=%d result=error stage=close error=%q", input.Bucket, input.Key, chunk.Part, sanitizeLogError(err))
 				_ = pw.CloseWithError(err)
 				return
 			}
