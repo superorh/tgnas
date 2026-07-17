@@ -284,6 +284,76 @@ func TestPutHeadGetDeleteObject(t *testing.T) {
 	}
 }
 
+func TestCopyObjectSameBucket(t *testing.T) {
+	server := newSignedTestServer(t)
+	put := signedRecorderRequest(t, http.MethodPut, "/photos/src.txt", "hello", map[string]string{"Content-Type": "text/plain"})
+	server.ServeHTTP(put.recorder, put.request)
+	if put.recorder.Code != http.StatusOK {
+		t.Fatalf("put status = %d body = %s", put.recorder.Code, put.recorder.Body.String())
+	}
+
+	copyReq := signedRecorderRequest(t, http.MethodPut, "/photos/dst.txt", "", map[string]string{"X-Amz-Copy-Source": "/photos/src.txt"})
+	server.ServeHTTP(copyReq.recorder, copyReq.request)
+	if copyReq.recorder.Code != http.StatusOK {
+		t.Fatalf("copy status = %d body = %s", copyReq.recorder.Code, copyReq.recorder.Body.String())
+	}
+	if !strings.Contains(copyReq.recorder.Body.String(), "<CopyObjectResult") || !strings.Contains(copyReq.recorder.Body.String(), `<ETag>&#34;5d41402abc4b2a76b9719d911017c592&#34;</ETag>`) {
+		t.Fatalf("copy body = %s", copyReq.recorder.Body.String())
+	}
+
+	get := signedRecorderRequest(t, http.MethodGet, "/photos/dst.txt", "", nil)
+	server.ServeHTTP(get.recorder, get.request)
+	if get.recorder.Code != http.StatusOK || get.recorder.Body.String() != "hello" {
+		t.Fatalf("get status = %d body = %q", get.recorder.Code, get.recorder.Body.String())
+	}
+
+	// The source object must still exist: CopyObject never deletes it.
+	srcGet := signedRecorderRequest(t, http.MethodGet, "/photos/src.txt", "", nil)
+	server.ServeHTTP(srcGet.recorder, srcGet.request)
+	if srcGet.recorder.Code != http.StatusOK || srcGet.recorder.Body.String() != "hello" {
+		t.Fatalf("source get status = %d body = %q", srcGet.recorder.Code, srcGet.recorder.Body.String())
+	}
+}
+
+func TestCopyObjectAcrossBuckets(t *testing.T) {
+	server := newSignedTestServer(t)
+	put := signedRecorderRequest(t, http.MethodPut, "/photos/src.txt", "hello", map[string]string{"Content-Type": "text/plain"})
+	server.ServeHTTP(put.recorder, put.request)
+	if put.recorder.Code != http.StatusOK {
+		t.Fatalf("put status = %d body = %s", put.recorder.Code, put.recorder.Body.String())
+	}
+
+	// "backups" is a different bucket, backed by a different Telegram
+	// chat_id in the newSignedTestServer fixture — this exercises the
+	// case rclone's --backup-dir relies on (moving content between two
+	// different Telegram channels), which tgnas previously could not
+	// serve at all: any PUT with X-Amz-Copy-Source fell through to a
+	// plain PutObject and returned 200 with no XML body.
+	copyReq := signedRecorderRequest(t, http.MethodPut, "/backups/src.txt", "", map[string]string{"X-Amz-Copy-Source": "/photos/src.txt"})
+	server.ServeHTTP(copyReq.recorder, copyReq.request)
+	if copyReq.recorder.Code != http.StatusOK {
+		t.Fatalf("copy status = %d body = %s", copyReq.recorder.Code, copyReq.recorder.Body.String())
+	}
+	if !strings.Contains(copyReq.recorder.Body.String(), "<CopyObjectResult") {
+		t.Fatalf("copy body = %s", copyReq.recorder.Body.String())
+	}
+
+	get := signedRecorderRequest(t, http.MethodGet, "/backups/src.txt", "", nil)
+	server.ServeHTTP(get.recorder, get.request)
+	if get.recorder.Code != http.StatusOK || get.recorder.Body.String() != "hello" {
+		t.Fatalf("get status = %d body = %q", get.recorder.Code, get.recorder.Body.String())
+	}
+}
+
+func TestCopyObjectMissingSourceReturnsNoSuchKey(t *testing.T) {
+	server := newSignedTestServer(t)
+	copyReq := signedRecorderRequest(t, http.MethodPut, "/photos/dst.txt", "", map[string]string{"X-Amz-Copy-Source": "/photos/missing.txt"})
+	server.ServeHTTP(copyReq.recorder, copyReq.request)
+	if copyReq.recorder.Code != http.StatusNotFound || !strings.Contains(copyReq.recorder.Body.String(), "<Code>NoSuchKey</Code>") {
+		t.Fatalf("copy status = %d body = %s", copyReq.recorder.Code, copyReq.recorder.Body.String())
+	}
+}
+
 func TestPresignedObjectGetAndHead(t *testing.T) {
 	server := newSignedTestServer(t)
 

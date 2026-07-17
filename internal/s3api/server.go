@@ -325,6 +325,10 @@ func (s *Server) handleObject(w http.ResponseWriter, r *http.Request, bucket, ke
 			s.uploadPart(w, r, bucket, key)
 			return
 		}
+		if r.Header.Get("X-Amz-Copy-Source") != "" {
+			s.copyObject(w, r, bucket, key)
+			return
+		}
 		s.putObject(w, r, bucket, key)
 	case http.MethodGet:
 		s.getObject(w, r, bucket, key)
@@ -517,6 +521,73 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key s
 	s.logger.Printf("debug event=s3_put_object_result bucket=%q key=%q result=success etag=%q", bucket, key, result.ETag)
 	w.Header().Set("ETag", fmt.Sprintf("\"%s\"", result.ETag))
 	w.WriteHeader(http.StatusOK)
+}
+
+// parseCopySource parses the value of the X-Amz-Copy-Source header, which
+// identifies the source object as "/bucket/key" (optionally without the
+// leading slash, URL-encoded, and with a trailing "?versionId=..." that
+// tgnas ignores since it has no object versioning).
+func parseCopySource(raw string) (bucket, key string, err error) {
+	raw = strings.TrimPrefix(raw, "/")
+	if idx := strings.Index(raw, "?"); idx >= 0 {
+		raw = raw[:idx]
+	}
+	if decoded, decodeErr := url.PathUnescape(raw); decodeErr == nil {
+		raw = decoded
+	}
+	bucket, key, ok := strings.Cut(raw, "/")
+	if !ok || bucket == "" || key == "" {
+		return "", "", fmt.Errorf("invalid X-Amz-Copy-Source %q", raw)
+	}
+	return bucket, key, nil
+}
+
+// copyObject implements S3 CopyObject (PUT with an X-Amz-Copy-Source
+// header). tgnas has no notion of a server-side "move a pointer" copy
+// backed by Telegram content shared between two chats/buckets, so this
+// always streams the object through the server: GetObject from the
+// source, PutObject to the destination. That's the only way to support
+// copies across two different buckets (i.e. two different Telegram
+// channels) — a real client-facing PutObject occurs for the destination,
+// same as any other upload. Only whole-object copy is supported;
+// multipart UploadPartCopy is not implemented.
+func (s *Server) copyObject(w http.ResponseWriter, r *http.Request, dstBucket, dstKey string) {
+	srcBucket, srcKey, err := parseCopySource(r.Header.Get("X-Amz-Copy-Source"))
+	if err != nil {
+		s.logger.Printf("debug event=s3_copy_object_request dst_bucket=%q dst_key=%q result=error stage=parse error=%q", dstBucket, dstKey, sanitizeLogError(err))
+		WriteErrorResponse(w, r, ErrInvalidArgument, r.URL.Path, "")
+		return
+	}
+	s.logger.Printf("debug event=s3_copy_object_request src_bucket=%q src_key=%q dst_bucket=%q dst_key=%q", srcBucket, srcKey, dstBucket, dstKey)
+	reader, info, err := s.store.GetObject(r.Context(), store.GetObjectInput{Bucket: srcBucket, Key: srcKey})
+	if err != nil {
+		s.logger.Printf("debug event=s3_copy_object_result src_bucket=%q src_key=%q dst_bucket=%q dst_key=%q result=error stage=get error=%q", srcBucket, srcKey, dstBucket, dstKey, sanitizeLogError(err))
+		WriteErrorResponse(w, r, MapError(err), r.URL.Path, "")
+		return
+	}
+	defer reader.Close()
+	contentType := info.ContentType
+	if header := r.Header.Get("Content-Type"); header != "" && r.Header.Get("X-Amz-Metadata-Directive") == "REPLACE" {
+		contentType = header
+	}
+	result, err := s.store.PutObject(r.Context(), store.PutObjectInput{
+		Bucket:      dstBucket,
+		Key:         dstKey,
+		ContentType: contentType,
+		Size:        info.Size,
+		Body:        reader,
+	})
+	if err != nil {
+		s.logger.Printf("debug event=s3_copy_object_result src_bucket=%q src_key=%q dst_bucket=%q dst_key=%q result=error stage=put error=%q", srcBucket, srcKey, dstBucket, dstKey, sanitizeLogError(err))
+		WriteErrorResponse(w, r, MapError(err), r.URL.Path, "")
+		return
+	}
+	s.logger.Printf("debug event=s3_copy_object_result src_bucket=%q src_key=%q dst_bucket=%q dst_key=%q result=success etag=%q", srcBucket, srcKey, dstBucket, dstKey, result.ETag)
+	writeXML(w, http.StatusOK, CopyObjectResult{
+		Xmlns:        "http://s3.amazonaws.com/doc/2006-03-01/",
+		ETag:         fmt.Sprintf("\"%s\"", result.ETag),
+		LastModified: time.Now().UTC().Format(time.RFC3339),
+	})
 }
 
 func sanitizeLogError(err error) string {

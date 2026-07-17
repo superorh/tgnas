@@ -74,3 +74,10 @@ type CompleteMultipartUploadResult struct {
 	Key     string   `xml:"Key"`
 	ETag    string   `xml:"ETag"`
 }
+
+type CopyObjectResult struct {
+	XMLName      xml.Name `xml:"CopyObjectResult"`
+	Xmlns        string   `xml:"xmlns,attr,omitempty"`
+	ETag         string   `xml:"ETag"`
+	LastModified string   `xml:"LastModified"`
+}
