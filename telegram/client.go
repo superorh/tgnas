@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
@@ -104,12 +105,16 @@ func (c *HTTPClient) Download(ctx context.Context, fileID string) (io.ReadCloser
 	values := url.Values{}
 	values.Set("file_id", fileID)
 
-	resp, err := c.doJSONRequest(ctx, http.MethodPost, c.methodURL("getFile"), "application/x-www-form-urlencoded", func() (io.ReadCloser, string, error) {
+	requestURL := c.methodURL("getFile")
+	log.Printf("debug event=telegram_get_file_request url=%q api_base_url=%q token_len=%d file_id=%q", requestURL, c.apiBaseURL, len(c.botToken), fileID)
+	resp, err := c.doJSONRequest(ctx, http.MethodPost, requestURL, "application/x-www-form-urlencoded", func() (io.ReadCloser, string, error) {
 		return io.NopCloser(strings.NewReader(values.Encode())), "application/x-www-form-urlencoded", nil
 	})
 	if err != nil {
+		log.Printf("debug event=telegram_get_file_result url=%q result=error stage=request error=%q", requestURL, err)
 		return nil, err
 	}
+	log.Printf("debug event=telegram_get_file_raw_response url=%q body=%q", requestURL, string(resp))
 
 	var envelope getFileEnvelope
 	if err := json.Unmarshal(resp, &envelope); err != nil {
