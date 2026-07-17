@@ -660,6 +660,42 @@ func TestClientUploadUnauthorizedReturnsClassifiedRequestError(t *testing.T) {
 	}
 }
 
+func TestClientDeleteMessageSendsChatAndMessageID(t *testing.T) {
+	var body string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/bottoken/deleteMessage" {
+			http.NotFound(w, r)
+			return
+		}
+		body = mustReadBodyString(t, w, r)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient("token", server.URL, http.DefaultClient)
+	if err := client.DeleteMessage(context.Background(), "-100", 42); err != nil {
+		t.Fatalf("DeleteMessage returned error: %v", err)
+	}
+	if !strings.Contains(body, "chat_id=-100") || !strings.Contains(body, "message_id=42") {
+		t.Fatalf("request body = %q", body)
+	}
+}
+
+func TestClientDeleteMessageReturnsErrorOnFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":false,"description":"Bad Request: message to delete not found"}`))
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient("token", server.URL, http.DefaultClient)
+	err := client.DeleteMessage(context.Background(), "-100", 42)
+	if err == nil || !strings.Contains(err.Error(), "message to delete not found") {
+		t.Fatalf("DeleteMessage err = %v, want it to mention the not-found reason", err)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {

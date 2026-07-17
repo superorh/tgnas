@@ -144,6 +144,35 @@ func (c *HTTPClient) Download(ctx context.Context, fileID string) (io.ReadCloser
 	return c.downloadFile(ctx, envelope.Result.FilePath)
 }
 
+// DeleteMessage removes a message the bot previously sent to chatID. The
+// caller should treat a "message to delete not found" style error as
+// already-deleted rather than a failure, since this is expected on a retry
+// or a double-delete.
+func (c *HTTPClient) DeleteMessage(ctx context.Context, chatID string, messageID int64) error {
+	values := url.Values{}
+	values.Set("chat_id", chatID)
+	values.Set("message_id", strconv.FormatInt(messageID, 10))
+
+	resp, err := c.doJSONRequest(ctx, http.MethodPost, c.methodURL("deleteMessage"), "application/x-www-form-urlencoded", func() (io.ReadCloser, string, error) {
+		return io.NopCloser(strings.NewReader(values.Encode())), "application/x-www-form-urlencoded", nil
+	})
+	if err != nil {
+		return err
+	}
+
+	var envelope struct {
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(resp, &envelope); err != nil {
+		return fmt.Errorf("decode telegram deleteMessage response: %w", err)
+	}
+	if !envelope.OK {
+		return telegramAPIError(envelope.Description)
+	}
+	return nil
+}
+
 func (c *HTTPClient) downloadFile(ctx context.Context, filePath string) (io.ReadCloser, error) {
 	fileURL := c.fileURL(filePath)
 	var lastErr error

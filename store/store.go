@@ -839,6 +839,28 @@ func (s *ObjectStore) DeleteObject(ctx context.Context, bucket, key string) erro
 	if err := s.HeadBucket(ctx, bucket); err != nil {
 		return err
 	}
+	_, chunks, err := s.meta.GetObject(ctx, bucket, key)
+	if err != nil {
+		if err == metadata.ErrNotFound {
+			return nil
+		}
+		return err
+	}
+	binding, err := s.bucketBinding(bucket)
+	if err != nil {
+		return err
+	}
+	for _, chunk := range chunks {
+		if err := binding.Telegram.DeleteMessage(ctx, binding.ChatID, chunk.TelegramMessageID); err != nil {
+			if isMessageAlreadyGone(err) {
+				s.logger.Printf("debug event=telegram_delete_message bucket=%q key=%q message_id=%d result=already_gone", bucket, key, chunk.TelegramMessageID)
+				continue
+			}
+			s.logger.Printf("debug event=telegram_delete_message bucket=%q key=%q message_id=%d result=error error=%q", bucket, key, chunk.TelegramMessageID, sanitizeLogError(err))
+			return fmt.Errorf("delete telegram message %d: %w", chunk.TelegramMessageID, err)
+		}
+		s.logger.Printf("debug event=telegram_delete_message bucket=%q key=%q message_id=%d result=success", bucket, key, chunk.TelegramMessageID)
+	}
 	if err := s.meta.DeleteObject(ctx, bucket, key); err != nil {
 		if err == metadata.ErrNotFound {
 			return nil
@@ -846,6 +868,14 @@ func (s *ObjectStore) DeleteObject(ctx context.Context, bucket, key string) erro
 		return err
 	}
 	return nil
+}
+
+// isMessageAlreadyGone reports whether a Telegram deleteMessage failure means
+// the message is already gone (a previous delete, or the same object deleted
+// twice) rather than a real failure - in which case DeleteObject should
+// still proceed to remove the metadata instead of getting permanently stuck.
+func isMessageAlreadyGone(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "message to delete not found")
 }
 
 func HumanSize(size int64) string {

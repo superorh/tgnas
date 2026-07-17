@@ -12,12 +12,14 @@ import (
 )
 
 type FakeTelegram struct {
-	mu           sync.Mutex
-	Uploads      []telegram.UploadRequest
-	Downloads    []string
-	Files        map[string]string
-	UploadFunc   func(context.Context, telegram.UploadRequest) (telegram.UploadedFile, error)
-	DownloadFunc func(context.Context, string) (io.ReadCloser, error)
+	mu                sync.Mutex
+	Uploads           []telegram.UploadRequest
+	Downloads         []string
+	Files             map[string]string
+	DeletedMessageIDs []int64
+	UploadFunc        func(context.Context, telegram.UploadRequest) (telegram.UploadedFile, error)
+	DownloadFunc      func(context.Context, string) (io.ReadCloser, error)
+	DeleteMessageFunc func(context.Context, string, int64) error
 }
 
 func NewFakeTelegram() *FakeTelegram {
@@ -61,4 +63,14 @@ func (f *FakeTelegram) Download(ctx context.Context, fileID string) (io.ReadClos
 		return nil, fmt.Errorf("fake telegram file %q not found", fileID)
 	}
 	return io.NopCloser(strings.NewReader(data)), nil
+}
+
+func (f *FakeTelegram) DeleteMessage(ctx context.Context, chatID string, messageID int64) error {
+	if f.DeleteMessageFunc != nil {
+		return f.DeleteMessageFunc(ctx, chatID, messageID)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.DeletedMessageIDs = append(f.DeletedMessageIDs, messageID)
+	return nil
 }
