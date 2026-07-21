@@ -856,6 +856,21 @@ func (s *ObjectStore) DeleteObject(ctx context.Context, bucket, key string) erro
 				s.logger.Printf("debug event=telegram_delete_message bucket=%q key=%q message_id=%d result=already_gone", bucket, key, chunk.TelegramMessageID)
 				continue
 			}
+			if isMessageTooOldToDelete(err) {
+				// Confirmed 2026-07-21: Telegram's Bot API refuses to delete
+				// channel messages older than ~48h, even with the bot granted
+				// can_delete_messages/"Supprimer les messages d'autrui" as an
+				// explicitly saved admin right (verified directly via a raw
+				// deleteMessage call after a fresh permission save + local
+				// Bot API Server restart — still refused). This is a hard
+				// platform limit, not a fixable config/permission issue.
+				// Proceeding anyway: the alternative is --backup-dir sync
+				// failing outright on every deletion older than 48h, forever.
+				// The old message is left orphaned (invisible to tgnas, but
+				// still physically present) in the source bucket's channel.
+				s.logger.Printf("WARNING event=telegram_delete_message bucket=%q key=%q message_id=%d result=orphaned_too_old error=%q", bucket, key, chunk.TelegramMessageID, sanitizeLogError(err))
+				continue
+			}
 			s.logger.Printf("debug event=telegram_delete_message bucket=%q key=%q message_id=%d result=error error=%q", bucket, key, chunk.TelegramMessageID, sanitizeLogError(err))
 			return fmt.Errorf("delete telegram message %d: %w", chunk.TelegramMessageID, err)
 		}
@@ -876,6 +891,19 @@ func (s *ObjectStore) DeleteObject(ctx context.Context, bucket, key string) erro
 // still proceed to remove the metadata instead of getting permanently stuck.
 func isMessageAlreadyGone(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "message to delete not found")
+}
+
+// isMessageTooOldToDelete reports whether a Telegram deleteMessage failure is
+// the Bot API's hard ~48h age limit rather than a real, actionable error.
+// Confirmed empirically (2026-07-21) to apply even when the bot has
+// can_delete_messages granted and saved on the channel — Telegram simply
+// does not allow bots to delete messages past this age via the Bot API,
+// regardless of admin rights. DeleteObject treats this the same as an
+// already-gone message (proceed, don't block the caller) but logs it as a
+// warning since, unlike "already gone", the message is NOT actually deleted
+// — it stays orphaned in the source channel.
+func isMessageTooOldToDelete(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "message can't be deleted")
 }
 
 func HumanSize(size int64) string {
