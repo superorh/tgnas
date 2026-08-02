@@ -184,6 +184,123 @@ func TestStoreCopyObjectMissingSourceReturnsNoSuchKey(t *testing.T) {
 	}
 }
 
+// TestStoreCopyObjectAcrossDifferentBotsReuploadsContent guards against a
+// real production incident: immich-library-drafts deliberately uses a
+// different bot token (TGNAS_BOT_TOKEN_DRAFTS) than immich-library, to
+// spread Telegram rate limits. A Telegram file_id is only ever valid for the
+// bot that sent or received it - it never carries over to a different bot.
+// The first CopyObject implementation always did a metadata-only copy
+// (repointing the new object at the SAME chunk file_ids), which for this
+// bucket pair produced an object that reported success and looked copied
+// via HeadObject, but was never actually retrievable through the drafts
+// bucket's own bot and never created any message in its Telegram chat -
+// confirmed in production (rclone's sync log said "Moved into backup dir",
+// but nothing ever appeared in the drafts channel). When the two buckets'
+// bot tokens differ, a real copy is required: download via the source
+// bot, then re-upload via the destination bot.
+func TestStoreCopyObjectAcrossDifferentBotsReuploadsContent(t *testing.T) {
+	ctx := context.Background()
+	meta, err := metadata.OpenSQLite(filepath.Join(t.TempDir(), "metadata.sqlite"))
+	if err != nil {
+		t.Fatalf("OpenSQLite returned error: %v", err)
+	}
+	defer meta.Close()
+	for name, chatID := range map[string]string{"immich-library": "-100", "immich-library-drafts": "-200"} {
+		if err := meta.UpsertBucket(ctx, metadata.Bucket{Name: name, ChatID: chatID, CreatedAt: time.Now().UTC(), Enabled: true}); err != nil {
+			t.Fatalf("UpsertBucket(%s) returned error: %v", name, err)
+		}
+	}
+	storageTG := testutil.NewFakeTelegram()
+	draftsTG := testutil.NewFakeTelegram()
+	caption, _ := telegram.ParseCaptionTemplate("")
+	objectStore := mustNewBucketBindingStore(t, meta, map[string]BucketBinding{
+		"immich-library":        {Name: "immich-library", ChatID: "-100", TokenSource: "global", TokenKey: "", Telegram: storageTG},
+		"immich-library-drafts": {Name: "immich-library-drafts", ChatID: "-200", TokenSource: "bucket", TokenKey: "drafts-token", Telegram: draftsTG},
+	}, Options{Upload: DefaultUploadConfig(), Caption: caption})
+
+	_, err = objectStore.PutObject(ctx, PutObjectInput{Bucket: "immich-library", Key: "photo.jpg", ContentType: "image/jpeg", Size: 5, Body: strings.NewReader("hello")})
+	if err != nil {
+		t.Fatalf("PutObject returned error: %v", err)
+	}
+	if len(storageTG.Uploads) != 1 {
+		t.Fatalf("storageTG.Uploads = %+v, want 1", storageTG.Uploads)
+	}
+
+	copyResult, err := objectStore.CopyObject(ctx, CopyObjectInput{
+		SourceBucket: "immich-library",
+		SourceKey:    "photo.jpg",
+		DestBucket:   "immich-library-drafts",
+		DestKey:      "photo.jpg",
+	})
+	if err != nil {
+		t.Fatalf("CopyObject returned error: %v", err)
+	}
+
+	// The destination bot must have actually received the content: this is
+	// what makes it show up as a real message in the drafts Telegram chat.
+	if len(draftsTG.Uploads) != 1 || draftsTG.Uploads[0].ChatID != "-200" {
+		t.Fatalf("draftsTG.Uploads = %+v, want one upload to chat -200", draftsTG.Uploads)
+	}
+	if len(storageTG.Uploads) != 1 {
+		t.Fatalf("storageTG.Uploads = %+v, want still 1 (source untouched)", storageTG.Uploads)
+	}
+
+	head, err := objectStore.HeadObject(ctx, "immich-library-drafts", "photo.jpg")
+	if err != nil {
+		t.Fatalf("HeadObject on copy returned error: %v", err)
+	}
+	if head.ETag != copyResult.ETag || head.Size != 5 {
+		t.Fatalf("copy head = %+v", head)
+	}
+
+	// Reading the copy back must go through the DESTINATION bot (draftsTG),
+	// proving the copied chunk's file_id is one draftsTG actually issued -
+	// not a stale reference to storageTG's file_id, which draftsTG could
+	// never resolve.
+	reader, _, err := objectStore.GetObject(ctx, GetObjectInput{Bucket: "immich-library-drafts", Key: "photo.jpg"})
+	if err != nil {
+		t.Fatalf("GetObject on copy returned error: %v", err)
+	}
+	defer reader.Close()
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll returned error: %v", err)
+	}
+	if string(data) != "hello" {
+		t.Fatalf("copy content = %q, want %q", string(data), "hello")
+	}
+}
+
+// TestStoreCopyObjectWithinSameBotStaysMetadataOnly locks in the cheap path:
+// when both buckets share the same bot, a copy must not cause a redundant
+// Telegram upload (avoids wasting Telegram API calls/rate limit budget for
+// what is, from the bot's point of view, a single already-uploaded file).
+func TestStoreCopyObjectWithinSameBotStaysMetadataOnly(t *testing.T) {
+	ctx := context.Background()
+	objectStore, fake := newReadyTestObjectStore(t, map[string]string{"immich-library": "-100", "immich-library-archive": "-100"})
+
+	_, err := objectStore.PutObject(ctx, PutObjectInput{Bucket: "immich-library", Key: "photo.jpg", ContentType: "image/jpeg", Size: 5, Body: strings.NewReader("hello")})
+	if err != nil {
+		t.Fatalf("PutObject returned error: %v", err)
+	}
+	if len(fake.Uploads) != 1 {
+		t.Fatalf("uploads after PutObject = %d, want 1", len(fake.Uploads))
+	}
+
+	_, err = objectStore.CopyObject(ctx, CopyObjectInput{
+		SourceBucket: "immich-library",
+		SourceKey:    "photo.jpg",
+		DestBucket:   "immich-library-archive",
+		DestKey:      "photo.jpg",
+	})
+	if err != nil {
+		t.Fatalf("CopyObject returned error: %v", err)
+	}
+	if len(fake.Uploads) != 1 {
+		t.Fatalf("uploads after CopyObject = %d, want still 1 (metadata-only copy)", len(fake.Uploads))
+	}
+}
+
 func TestStorePutZeroByteObjectStoresMetadataWithoutTelegramUpload(t *testing.T) {
 	ctx := context.Background()
 	meta, err := metadata.OpenSQLite(filepath.Join(t.TempDir(), "metadata.sqlite"))

@@ -708,6 +708,35 @@ func (s *ObjectStore) CopyObject(ctx context.Context, input CopyObjectInput) (Co
 		return CopyObjectResult{}, err
 	}
 
+	sourceBinding, err := s.bucketBinding(input.SourceBucket)
+	if err != nil {
+		return CopyObjectResult{}, err
+	}
+	destBinding, err := s.bucketBinding(input.DestBucket)
+	if err != nil {
+		return CopyObjectResult{}, err
+	}
+
+	// A chunk's Telegram file_id is only ever valid for the bot that sent or
+	// received it - it does not carry over to a different bot token. Buckets
+	// that share the same bot (e.g. two logical buckets both using the
+	// default bot) can be "copied" for free by just repointing metadata at
+	// the same chunks. Buckets on different bots (immich-library-drafts
+	// deliberately uses its own TGNAS_BOT_TOKEN_DRAFTS, to spread rate
+	// limits) cannot: a metadata-only copy there produced an object that
+	// LOOKED copied (S3 metadata said so, rclone reported success) but was
+	// never actually retrievable through the destination bucket's bot and
+	// never showed up in its Telegram chat at all - confirmed in production
+	// (no message ever appeared in the drafts channel despite "Moved into
+	// backup dir" in the sync log). In that case a real copy is required:
+	// download via the source bot, re-upload via the destination bot.
+	if sourceBinding.TokenKey == destBinding.TokenKey {
+		return s.copyObjectMetadataOnly(ctx, input)
+	}
+	return s.copyObjectReupload(ctx, input)
+}
+
+func (s *ObjectStore) copyObjectMetadataOnly(ctx context.Context, input CopyObjectInput) (CopyObjectResult, error) {
 	releaseLock := s.locker.Lock(input.DestBucket, input.DestKey)
 	defer releaseLock()
 
@@ -738,6 +767,26 @@ func (s *ObjectStore) CopyObject(ctx context.Context, input CopyObjectInput) (Co
 	}
 	s.logMetadataPutObject(input.DestBucket, input.DestKey, len(newChunks), newObject.ETag, nil)
 	return CopyObjectResult{ETag: newObject.ETag, LastModified: now}, nil
+}
+
+func (s *ObjectStore) copyObjectReupload(ctx context.Context, input CopyObjectInput) (CopyObjectResult, error) {
+	reader, info, err := s.GetObject(ctx, GetObjectInput{Bucket: input.SourceBucket, Key: input.SourceKey})
+	if err != nil {
+		return CopyObjectResult{}, err
+	}
+	defer reader.Close()
+
+	putResult, err := s.PutObject(ctx, PutObjectInput{
+		Bucket:      input.DestBucket,
+		Key:         input.DestKey,
+		ContentType: info.ContentType,
+		Size:        info.Size,
+		Body:        reader,
+	})
+	if err != nil {
+		return CopyObjectResult{}, err
+	}
+	return CopyObjectResult{ETag: putResult.ETag, LastModified: time.Now().UTC()}, nil
 }
 
 func (s *ObjectStore) ListObjects(ctx context.Context, input ListObjectsInput) (ListObjectsResult, error) {
