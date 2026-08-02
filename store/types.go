@@ -96,6 +96,18 @@ type GetObjectInput struct {
 	Range  *ByteRange
 }
 
+type CopyObjectInput struct {
+	SourceBucket string
+	SourceKey    string
+	DestBucket   string
+	DestKey      string
+}
+
+type CopyObjectResult struct {
+	ETag         string
+	LastModified time.Time
+}
+
 type ListObjectsInput struct {
 	Bucket    string
 	Prefix    string

@@ -503,6 +503,50 @@ func TestPutObjectAcceptsUnsignedPayload(t *testing.T) {
 	}
 }
 
+// TestCopyObjectMovesContentWithoutReupload guards against a real production
+// incident: a CopyObject request (a PUT with X-Amz-Copy-Source and no body)
+// used to fall through to the ordinary putObject route, which read the
+// empty body and silently created a 0-byte destination object while never
+// writing the CopyObjectResult XML body S3 clients require - surfacing to
+// real clients (rclone's --backup-dir) as "deserialization failed, received
+// empty response payload" and aborting every sync needing to back a file up
+// before deleting it.
+func TestCopyObjectMovesContentWithoutReupload(t *testing.T) {
+	server := newSignedTestServer(t)
+
+	put := signedRecorderRequest(t, http.MethodPut, "/photos/source.txt", "hello", map[string]string{"Content-Type": "text/plain"})
+	server.ServeHTTP(put.recorder, put.request)
+	if put.recorder.Code != http.StatusOK {
+		t.Fatalf("put status = %d body = %s", put.recorder.Code, put.recorder.Body.String())
+	}
+
+	copyReq := signedRecorderRequest(t, http.MethodPut, "/backups/source.txt", "", map[string]string{"X-Amz-Copy-Source": "/photos/source.txt"})
+	server.ServeHTTP(copyReq.recorder, copyReq.request)
+	if copyReq.recorder.Code != http.StatusOK {
+		t.Fatalf("copy status = %d body = %s", copyReq.recorder.Code, copyReq.recorder.Body.String())
+	}
+	body := copyReq.recorder.Body.String()
+	if !strings.Contains(body, "<CopyObjectResult") || !strings.Contains(body, "<ETag>") || !strings.Contains(body, "<LastModified>") {
+		t.Fatalf("copy body missing CopyObjectResult XML: %q", body)
+	}
+
+	get := signedRecorderRequest(t, http.MethodGet, "/backups/source.txt", "", nil)
+	server.ServeHTTP(get.recorder, get.request)
+	if get.recorder.Code != http.StatusOK || get.recorder.Body.String() != "hello" {
+		t.Fatalf("get status = %d body = %q, want the copied content", get.recorder.Code, get.recorder.Body.String())
+	}
+}
+
+func TestCopyObjectMissingSourceReturns404(t *testing.T) {
+	server := newSignedTestServer(t)
+
+	copyReq := signedRecorderRequest(t, http.MethodPut, "/backups/dest.txt", "", map[string]string{"X-Amz-Copy-Source": "/photos/missing.txt"})
+	server.ServeHTTP(copyReq.recorder, copyReq.request)
+	if copyReq.recorder.Code != http.StatusNotFound || !strings.Contains(copyReq.recorder.Body.String(), "NoSuchKey") {
+		t.Fatalf("copy status = %d body = %s", copyReq.recorder.Code, copyReq.recorder.Body.String())
+	}
+}
+
 func TestDebugLogsQuoteRequestFieldsAndSanitizeErrors(t *testing.T) {
 	var logs bytes.Buffer
 	server := NewServer(errorPutObjectStore{err: errors.New("bot_token=123456:secret secret_key=plain")}, Options{
@@ -926,6 +970,10 @@ func (s errorPutObjectStore) CompleteMultipartUpload(context.Context, store.Comp
 
 func (s errorPutObjectStore) AbortMultipartUpload(context.Context, store.AbortMultipartUploadInput) error {
 	return store.ErrNotImplemented
+}
+
+func (s errorPutObjectStore) CopyObject(context.Context, store.CopyObjectInput) (store.CopyObjectResult, error) {
+	return store.CopyObjectResult{}, store.ErrNotImplemented
 }
 
 type signedHTTPTest struct {

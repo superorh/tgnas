@@ -1766,6 +1766,10 @@ func (proxySigV4ObjectStore) AbortMultipartUpload(context.Context, store.AbortMu
 	return store.ErrNotImplemented
 }
 
+func (proxySigV4ObjectStore) CopyObject(context.Context, store.CopyObjectInput) (store.CopyObjectResult, error) {
+	return store.CopyObjectResult{}, store.ErrNotImplemented
+}
+
 func signRequestForProxyTest(t *testing.T, request *http.Request) {
 	t.Helper()
 	payloadHash := request.Header.Get("X-Amz-Content-Sha256")

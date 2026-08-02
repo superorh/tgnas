@@ -103,6 +103,87 @@ func TestStorePutHeadDeleteAndList(t *testing.T) {
 	}
 }
 
+// TestStoreCopyObjectCopiesMetadataWithoutReuploadingToTelegram guards
+// against a real production incident: CopyObject (used by rclone's
+// --backup-dir, e.g. to move a deleted file's Telegram copy aside before
+// deleting it) was entirely unimplemented - the S3 route fell through to
+// PutObject, which read the request's empty body (a CopyObject request has
+// no body, the source is named via a header) and silently created a
+// 0-byte object, then failed to return the XML body S3 clients require,
+// surfacing as "deserialization failed, received empty response payload"
+// and aborting every sync that needed to move a file to backup-dir. A copy
+// only needs to point new metadata at the same Telegram chunks under the
+// new bucket/key - no re-upload required.
+func TestStoreCopyObjectCopiesMetadataWithoutReuploadingToTelegram(t *testing.T) {
+	ctx := context.Background()
+	objectStore, fake := newReadyTestObjectStore(t, map[string]string{"immich-library": "-100", "immich-library-drafts": "-200"})
+
+	putResult, err := objectStore.PutObject(ctx, PutObjectInput{Bucket: "immich-library", Key: "photo.jpg", ContentType: "image/jpeg", Size: 5, Body: strings.NewReader("hello")})
+	if err != nil {
+		t.Fatalf("PutObject returned error: %v", err)
+	}
+	if len(fake.Uploads) != 1 {
+		t.Fatalf("uploads after PutObject = %d, want 1", len(fake.Uploads))
+	}
+
+	copyResult, err := objectStore.CopyObject(ctx, CopyObjectInput{
+		SourceBucket: "immich-library",
+		SourceKey:    "photo.jpg",
+		DestBucket:   "immich-library-drafts",
+		DestKey:      "photo.jpg",
+	})
+	if err != nil {
+		t.Fatalf("CopyObject returned error: %v", err)
+	}
+	if copyResult.ETag != putResult.ETag {
+		t.Fatalf("copy etag = %q, want %q", copyResult.ETag, putResult.ETag)
+	}
+	if len(fake.Uploads) != 1 {
+		t.Fatalf("uploads after CopyObject = %d, want still 1 (no re-upload)", len(fake.Uploads))
+	}
+
+	head, err := objectStore.HeadObject(ctx, "immich-library-drafts", "photo.jpg")
+	if err != nil {
+		t.Fatalf("HeadObject on copy returned error: %v", err)
+	}
+	if head.ETag != putResult.ETag || head.Size != 5 || head.ContentType != "image/jpeg" {
+		t.Fatalf("copy head = %+v", head)
+	}
+
+	reader, _, err := objectStore.GetObject(ctx, GetObjectInput{Bucket: "immich-library-drafts", Key: "photo.jpg"})
+	if err != nil {
+		t.Fatalf("GetObject on copy returned error: %v", err)
+	}
+	defer reader.Close()
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll returned error: %v", err)
+	}
+	if string(data) != "hello" {
+		t.Fatalf("copy content = %q, want %q", string(data), "hello")
+	}
+
+	// The original object must be untouched by the copy.
+	if _, err := objectStore.HeadObject(ctx, "immich-library", "photo.jpg"); err != nil {
+		t.Fatalf("HeadObject on source returned error: %v", err)
+	}
+}
+
+func TestStoreCopyObjectMissingSourceReturnsNoSuchKey(t *testing.T) {
+	ctx := context.Background()
+	objectStore, _ := newReadyTestObjectStore(t, map[string]string{"immich-library": "-100", "immich-library-drafts": "-200"})
+
+	_, err := objectStore.CopyObject(ctx, CopyObjectInput{
+		SourceBucket: "immich-library",
+		SourceKey:    "missing.jpg",
+		DestBucket:   "immich-library-drafts",
+		DestKey:      "missing.jpg",
+	})
+	if err != ErrNoSuchKey {
+		t.Fatalf("err = %v, want ErrNoSuchKey", err)
+	}
+}
+
 func TestStorePutZeroByteObjectStoresMetadataWithoutTelegramUpload(t *testing.T) {
 	ctx := context.Background()
 	meta, err := metadata.OpenSQLite(filepath.Join(t.TempDir(), "metadata.sqlite"))

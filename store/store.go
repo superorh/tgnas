@@ -685,6 +685,61 @@ func (s *ObjectStore) GetObject(ctx context.Context, input GetObjectInput) (io.R
 	return &cancelReadCloser{ReadCloser: pr, cancel: cancel}, info, nil
 }
 
+// CopyObject was entirely unimplemented until now: the S3 route for it (a
+// PUT with an x-amz-copy-source header and no body) fell straight through to
+// putObject, which read the (empty) request body and silently created a
+// 0-byte object at the destination while never writing the XML
+// CopyObjectResult body S3 clients expect - observed in production as
+// rclone's "operation error S3: CopyObject ... deserialization failed,
+// received empty response payload" on every --backup-dir move, which
+// aborted the whole sync (rclone correctly refuses to delete a source file
+// once its backup copy fails) rather than actually losing data.
+//
+// A copy needs no Telegram interaction at all: the chunks already exist on
+// Telegram, so copying is just pointing new object metadata at the same
+// chunk file_ids under the new bucket/key - cheaper than a real copy and,
+// as a side benefit, avoids re-uploading duplicate content to Telegram for
+// what S3 clients consider a single logical object move.
+func (s *ObjectStore) CopyObject(ctx context.Context, input CopyObjectInput) (CopyObjectResult, error) {
+	if err := s.HeadBucket(ctx, input.SourceBucket); err != nil {
+		return CopyObjectResult{}, err
+	}
+	if err := s.HeadBucket(ctx, input.DestBucket); err != nil {
+		return CopyObjectResult{}, err
+	}
+
+	releaseLock := s.locker.Lock(input.DestBucket, input.DestKey)
+	defer releaseLock()
+
+	object, chunks, err := s.meta.GetObject(ctx, input.SourceBucket, input.SourceKey)
+	if err != nil {
+		if err == metadata.ErrNotFound {
+			return CopyObjectResult{}, ErrNoSuchKey
+		}
+		return CopyObjectResult{}, err
+	}
+
+	now := time.Now().UTC()
+	newObject := object
+	newObject.Bucket = input.DestBucket
+	newObject.Key = input.DestKey
+	newObject.LastModified = now
+
+	newChunks := make([]metadata.Chunk, len(chunks))
+	for i, chunk := range chunks {
+		newChunks[i] = chunk
+		newChunks[i].Bucket = input.DestBucket
+		newChunks[i].Key = input.DestKey
+	}
+
+	if err := s.meta.PutObject(ctx, newObject, newChunks); err != nil {
+		s.logMetadataPutObject(input.DestBucket, input.DestKey, len(newChunks), newObject.ETag, err)
+		return CopyObjectResult{}, err
+	}
+	s.logMetadataPutObject(input.DestBucket, input.DestKey, len(newChunks), newObject.ETag, nil)
+	return CopyObjectResult{ETag: newObject.ETag, LastModified: now}, nil
+}
+
 func (s *ObjectStore) ListObjects(ctx context.Context, input ListObjectsInput) (ListObjectsResult, error) {
 	if err := s.HeadBucket(ctx, input.Bucket); err != nil {
 		return ListObjectsResult{}, err

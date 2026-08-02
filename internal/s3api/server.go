@@ -30,6 +30,7 @@ type ObjectStore interface {
 	UploadPart(ctx context.Context, input store.UploadPartInput) (store.UploadPartResult, error)
 	CompleteMultipartUpload(ctx context.Context, input store.CompleteMultipartUploadInput) (store.CompleteMultipartUploadResult, error)
 	AbortMultipartUpload(ctx context.Context, input store.AbortMultipartUploadInput) error
+	CopyObject(ctx context.Context, input store.CopyObjectInput) (store.CopyObjectResult, error)
 }
 
 type Options struct {
@@ -325,6 +326,14 @@ func (s *Server) handleObject(w http.ResponseWriter, r *http.Request, bucket, ke
 			s.uploadPart(w, r, bucket, key)
 			return
 		}
+		// A CopyObject request is a PUT with x-amz-copy-source and no body -
+		// it used to fall straight through to putObject, which read the
+		// (empty) body and silently created a 0-byte destination object
+		// instead of actually copying anything.
+		if r.Header.Get("X-Amz-Copy-Source") != "" {
+			s.copyObject(w, r, bucket, key)
+			return
+		}
 		s.putObject(w, r, bucket, key)
 	case http.MethodGet:
 		s.getObject(w, r, bucket, key)
@@ -517,6 +526,61 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key s
 	s.logger.Printf("debug event=s3_put_object_result bucket=%q key=%q result=success etag=%q", bucket, key, result.ETag)
 	w.Header().Set("ETag", fmt.Sprintf("\"%s\"", result.ETag))
 	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) copyObject(w http.ResponseWriter, r *http.Request, destBucket, destKey string) {
+	source := r.Header.Get("X-Amz-Copy-Source")
+	sourceBucket, sourceKey, err := parseCopySource(source)
+	if err != nil {
+		s.logger.Printf("debug event=s3_copy_object_request result=error error=%q copy_source=%q", sanitizeLogError(err), source)
+		WriteErrorResponse(w, r, ErrInvalidArgument, r.URL.Path, "")
+		return
+	}
+	s.logger.Printf("debug event=s3_copy_object_request source_bucket=%q source_key=%q dest_bucket=%q dest_key=%q", sourceBucket, sourceKey, destBucket, destKey)
+	result, err := s.store.CopyObject(r.Context(), store.CopyObjectInput{
+		SourceBucket: sourceBucket,
+		SourceKey:    sourceKey,
+		DestBucket:   destBucket,
+		DestKey:      destKey,
+	})
+	if err != nil {
+		s.logger.Printf("debug event=s3_copy_object_result dest_bucket=%q dest_key=%q result=error error=%q", destBucket, destKey, sanitizeLogError(err))
+		WriteErrorResponse(w, r, MapError(err), r.URL.Path, "")
+		return
+	}
+	s.logger.Printf("debug event=s3_copy_object_result dest_bucket=%q dest_key=%q result=success etag=%q", destBucket, destKey, result.ETag)
+	writeXML(w, http.StatusOK, CopyObjectResult{
+		Xmlns:        "http://s3.amazonaws.com/doc/2006-03-01/",
+		ETag:         fmt.Sprintf("\"%s\"", result.ETag),
+		LastModified: result.LastModified.UTC().Format(time.RFC3339),
+	})
+}
+
+// parseCopySource splits an x-amz-copy-source header into bucket and key.
+// Real clients send it two ways: with a leading slash ("/bucket/key") or
+// without ("bucket/key"), and the key portion is URL-encoded (so an object
+// key containing a literal "/" - e.g. a chunk path - round-trips correctly
+// rather than being mistaken for a path separator). A trailing
+// "?versionId=..." is not something tgnas's buckets support, so it's
+// stripped rather than treated as part of the key.
+func parseCopySource(source string) (bucket, key string, err error) {
+	source = strings.TrimPrefix(source, "/")
+	if idx := strings.Index(source, "?"); idx >= 0 {
+		source = source[:idx]
+	}
+	parts := strings.SplitN(source, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("invalid x-amz-copy-source %q", source)
+	}
+	bucket, err = url.PathUnescape(parts[0])
+	if err != nil {
+		return "", "", fmt.Errorf("invalid x-amz-copy-source bucket: %w", err)
+	}
+	key, err = url.PathUnescape(parts[1])
+	if err != nil {
+		return "", "", fmt.Errorf("invalid x-amz-copy-source key: %w", err)
+	}
+	return bucket, key, nil
 }
 
 func sanitizeLogError(err error) string {
