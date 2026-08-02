@@ -181,6 +181,77 @@ func TestClientDownloadReadsLocalAbsoluteFilePath(t *testing.T) {
 	}
 }
 
+// TestClientDownloadWaitsForLocalFileToFinishWriting guards against a real
+// production incident: for a file_id not yet cached on disk,
+// telegram-bot-api's getFile response (reporting file_path and the file's
+// final file_size, known from Telegram up-front) arrives before the actual
+// bytes are fully written to that path in the background. Reading
+// immediately raced that write and returned a truncated file (a plain file
+// read hits EOF at whatever size currently exists, unlike a pipe it never
+// blocks for more data) - observed as "corrupted on transfer: md5 hashes
+// differ" with a different wrong hash on every retry, across files sharing
+// no Telegram file_id, so a per-file_id lock alone could not fix it.
+func TestClientDownloadWaitsForLocalFileToFinishWriting(t *testing.T) {
+	dir := t.TempDir()
+	absPath := filepath.Join(dir, "documents", "file_1.bin")
+	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	fullContent := "hello local, now complete!"
+	if err := os.WriteFile(absPath, []byte(fullContent[:3]), 0o644); err != nil {
+		t.Fatalf("WriteFile (partial): %v", err)
+	}
+
+	writeDone := make(chan struct{})
+	go func() {
+		defer close(writeDone)
+		time.Sleep(150 * time.Millisecond)
+		f, err := os.OpenFile(absPath, os.O_WRONLY, 0o644)
+		if err != nil {
+			t.Errorf("OpenFile for append-write: %v", err)
+			return
+		}
+		defer f.Close()
+		if _, err := f.WriteAt([]byte(fullContent), 0); err != nil {
+			t.Errorf("WriteAt: %v", err)
+		}
+	}()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/bottoken/getFile":
+			mustDrainBody(t, w, r)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"ok":true,"result":{"file_id":"file-1","file_path":%q,"file_size":%d}}`, absPath, len(fullContent))))
+		default:
+			t.Errorf("unexpected HTTP request for local-mode file: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient("token", server.URL, http.DefaultClient)
+	stream, err := client.Download(context.Background(), "file-1")
+	if err != nil {
+		t.Fatalf("Download returned error: %v", err)
+	}
+	defer stream.Close()
+
+	// No wait here on purpose: with the fix, Download() only returns once
+	// the on-disk file has already reached its full expected size, so an
+	// immediate read must see the complete content. Waiting for writeDone
+	// first would mask the race this test exists to catch.
+	data, err := io.ReadAll(stream)
+	if err != nil {
+		t.Fatalf("ReadAll returned error: %v", err)
+	}
+	if string(data) != fullContent {
+		t.Fatalf("data = %q, want %q (Download returned before the file finished writing)", string(data), fullContent)
+	}
+	<-writeDone
+}
+
 func TestClientUploadStreamsMultipartBody(t *testing.T) {
 	started := make(chan struct{})
 	finish := make(chan struct{})

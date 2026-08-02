@@ -134,18 +134,65 @@ func (c *HTTPClient) Download(ctx context.Context, fileID string) (io.ReadCloser
 	// which telegram-bot-api cannot resolve, resulting in an empty/truncated
 	// response (observed as "unexpected EOF" on every single download).
 	if filepath.IsAbs(envelope.Result.FilePath) {
-		return c.openLocalFile(envelope.Result.FilePath)
+		return c.openLocalFile(ctx, envelope.Result.FilePath, envelope.Result.FileSize)
 	}
 
 	return c.downloadFile(ctx, envelope.Result.FilePath)
 }
 
-func (c *HTTPClient) openLocalFile(filePath string) (io.ReadCloser, error) {
+// localFileReadyTimeout bounds how long openLocalFile waits for
+// telegram-bot-api to finish writing a file to disk before giving up.
+const localFileReadyTimeout = 10 * time.Minute
+
+func (c *HTTPClient) openLocalFile(ctx context.Context, filePath string, expectedSize int64) (io.ReadCloser, error) {
+	// getFile's HTTP response returns as soon as telegram-bot-api knows the
+	// file's metadata (including its final size, reported by Telegram
+	// up-front), not once the file is fully written to local disk - for a
+	// file_id whose content isn't already cached locally, the actual bytes
+	// are still being fetched from Telegram's servers and written to
+	// filePath in the background when this response arrives. A plain
+	// os.Open+read here would race that write: regular file reads don't
+	// block for more data like a pipe does, they just return whatever is on
+	// disk right now and hit EOF, silently producing a truncated file - this
+	// was observed in production as "corrupted on transfer: md5 hashes
+	// differ" with a DIFFERENT wrong hash on every retry (a different
+	// truncation point each time), affecting distinct files with no
+	// file_id in common, so it can't be fixed by per-file_id locking alone.
+	if expectedSize > 0 {
+		if err := waitForLocalFileSize(ctx, filePath, expectedSize, localFileReadyTimeout); err != nil {
+			return nil, err
+		}
+	}
+
 	f, err := os.Open(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("open local telegram file: %w", err)
 	}
 	return f, nil
+}
+
+func waitForLocalFileSize(ctx context.Context, filePath string, expectedSize int64, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		info, err := os.Stat(filePath)
+		if err == nil && info.Size() >= expectedSize {
+			return nil
+		}
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("stat telegram local file: %w", err)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %s waiting for telegram local file %q to reach expected size %d", timeout, filePath, expectedSize)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func (c *HTTPClient) downloadFile(ctx context.Context, filePath string) (io.ReadCloser, error) {
