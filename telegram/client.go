@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"net/textproto"
 	"net/url"
+	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -122,7 +124,28 @@ func (c *HTTPClient) Download(ctx context.Context, fileID string) (io.ReadCloser
 		return nil, errors.New("telegram getFile response missing file_path")
 	}
 
+	// The Local Bot API Server (--local) returns an absolute filesystem path
+	// in file_path instead of a relative one: the file already sits on disk
+	// (tgnas mounts the same volume as telegram-bot-api, read-only, at the
+	// identical path), so it must be read directly rather than requested via
+	// the /file/bot<token>/... HTTP endpoint - that endpoint does not serve
+	// local-mode files and building a URL from an absolute path produces a
+	// broken request (the whole absolute path gets re-embedded in the URL),
+	// which telegram-bot-api cannot resolve, resulting in an empty/truncated
+	// response (observed as "unexpected EOF" on every single download).
+	if filepath.IsAbs(envelope.Result.FilePath) {
+		return c.openLocalFile(envelope.Result.FilePath)
+	}
+
 	return c.downloadFile(ctx, envelope.Result.FilePath)
+}
+
+func (c *HTTPClient) openLocalFile(filePath string) (io.ReadCloser, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("open local telegram file: %w", err)
+	}
+	return f, nil
 }
 
 func (c *HTTPClient) downloadFile(ctx context.Context, filePath string) (io.ReadCloser, error) {

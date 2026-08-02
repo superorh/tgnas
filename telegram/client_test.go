@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -126,6 +128,55 @@ func TestClientDownloadStreamUsesGetFilePath(t *testing.T) {
 		t.Fatalf("ReadAll returned error: %v", err)
 	}
 	if string(data) != "hello" {
+		t.Fatalf("data = %q", string(data))
+	}
+}
+
+// TestClientDownloadReadsLocalAbsoluteFilePath guards against a real
+// production incident: the Local Bot API Server (--local flag) returns an
+// absolute filesystem path in getFile's file_path when tgnas is deployed
+// with a Local Bot API Server sidecar sharing its data volume (as in the
+// Kubernetes deployment, where tgnas mounts telegram-bot-api's own PVC
+// read-only at the identical path). Building an HTTP URL from that absolute
+// path (the previous behavior) produces a broken request the server can't
+// resolve, causing every single download to fail with "unexpected EOF" -
+// the file must instead be read directly from the shared disk.
+func TestClientDownloadReadsLocalAbsoluteFilePath(t *testing.T) {
+	dir := t.TempDir()
+	absPath := filepath.Join(dir, "documents", "file_1.txt")
+	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(absPath, []byte("hello local"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/bottoken/getFile":
+			mustDrainBody(t, w, r)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"ok":true,"result":{"file_id":"file-1","file_path":%q,"file_size":11}}`, absPath)))
+		default:
+			// The /file/... HTTP endpoint must never be hit for an absolute
+			// (local-mode) file_path - reaching here means the fix regressed.
+			t.Errorf("unexpected HTTP request for local-mode file: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient("token", server.URL, http.DefaultClient)
+	stream, err := client.Download(context.Background(), "file-1")
+	if err != nil {
+		t.Fatalf("Download returned error: %v", err)
+	}
+	defer stream.Close()
+	data, err := io.ReadAll(stream)
+	if err != nil {
+		t.Fatalf("ReadAll returned error: %v", err)
+	}
+	if string(data) != "hello local" {
 		t.Fatalf("data = %q", string(data))
 	}
 }
