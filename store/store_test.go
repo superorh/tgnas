@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1059,6 +1060,100 @@ func TestStoreGetObjectCloseReleasesDownloadSlot(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("second GetObject stayed blocked after first reader closed early")
 	}
+}
+
+// TestStoreGetObjectSerializesConcurrentDownloadsOfSameFileID guards against
+// a real production incident: rclone's multi-thread copy mode issues several
+// concurrent Range GET requests against the same S3 object, each triggering
+// an independent downloadChunk call for the same underlying Telegram
+// file_id. Racing telegram-bot-api's own local-mode file handling this way
+// was observed to intermittently serve corrupted content (a different wrong
+// md5 on every retry). downloadChunk must serialize concurrent downloads of
+// the same file_id so only one is ever in flight at a time.
+func TestStoreGetObjectSerializesConcurrentDownloadsOfSameFileID(t *testing.T) {
+	ctx := context.Background()
+	objectStore, fake := newReadyTestObjectStore(t, map[string]string{"photos": "-100"})
+	payload := strings.Repeat("abcdefgh", 4096)
+	_, err := objectStore.PutObject(ctx, PutObjectInput{Bucket: "photos", Key: "hello.bin", ContentType: "application/octet-stream", Size: int64(len(payload)), Body: strings.NewReader(payload)})
+	if err != nil {
+		t.Fatalf("PutObject returned error: %v", err)
+	}
+
+	var mu sync.Mutex
+	inFlight := 0
+	raced := false
+	fake.DownloadFunc = func(ctx context.Context, fileID string) (io.ReadCloser, error) {
+		mu.Lock()
+		inFlight++
+		if inFlight > 1 {
+			raced = true
+		}
+		mu.Unlock()
+
+		time.Sleep(20 * time.Millisecond)
+
+		return &testCountingReadCloser{
+			Reader: strings.NewReader(payload),
+			onClose: func() {
+				mu.Lock()
+				inFlight--
+				mu.Unlock()
+			},
+		}, nil
+	}
+
+	store := mustNewObjectStore(t, objectStore.meta, fake, Options{Upload: DefaultUploadConfig()})
+
+	const concurrency = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, concurrency)
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			reader, _, err := store.GetObject(ctx, GetObjectInput{Bucket: "photos", Key: "hello.bin"})
+			if err != nil {
+				errs <- err
+				return
+			}
+			data, readErr := io.ReadAll(reader)
+			closeErr := reader.Close()
+			if readErr != nil {
+				errs <- readErr
+				return
+			}
+			if closeErr != nil {
+				errs <- closeErr
+				return
+			}
+			if string(data) != payload {
+				errs <- fmt.Errorf("data mismatch: got %d bytes, want %d", len(data), len(payload))
+				return
+			}
+			errs <- nil
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent GetObject failed: %v", err)
+		}
+	}
+
+	if raced {
+		t.Fatal("concurrent downloads of the same file_id were not serialized")
+	}
+}
+
+type testCountingReadCloser struct {
+	*strings.Reader
+	onClose func()
+}
+
+func (c *testCountingReadCloser) Close() error {
+	c.onClose()
+	return nil
 }
 
 func TestStoreReturnsStartupBucketSnapshotFailure(t *testing.T) {

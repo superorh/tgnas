@@ -29,6 +29,7 @@ type ObjectStore struct {
 	options            Options
 	resolver           *UploadStrategyResolver
 	locker             *KeyedLocker
+	downloadLocker     *KeyedLocker
 	uploads            chan struct{}
 	downloads          chan struct{}
 	telegramSem        chan struct{}
@@ -122,6 +123,7 @@ func NewObjectStore(meta metadata.Store, tg telegram.Client, options Options) (*
 		options:            options,
 		resolver:           NewUploadStrategyResolver(upload),
 		locker:             NewKeyedLocker(),
+		downloadLocker:     NewKeyedLocker(),
 		logger:             options.Logger,
 		startupBuckets:     map[string]metadata.Bucket{},
 		bucketBindings:     map[string]BucketBinding{},
@@ -1206,12 +1208,28 @@ func (s *ObjectStore) downloadChunk(ctx context.Context, binding BucketBinding, 
 	if release == nil {
 		return nil, ctx.Err()
 	}
+
+	// Serialize concurrent downloads of the same Telegram file_id: rclone's
+	// multi-thread copy mode issues several concurrent Range GET requests
+	// against the same S3 object, each independently calling getFile/
+	// download for the underlying chunk. Racing telegram-bot-api's own
+	// local-mode file handling this way was observed in production to
+	// intermittently serve corrupted content (a different wrong md5 on
+	// every retry, consistent with a write race rather than a permanently
+	// bad stored file). The lock is held for the reader's whole lifetime,
+	// not just the initial Download() call, so a second concurrent request
+	// only proceeds once the first has fully finished streaming and closed.
+	releaseFileLock := s.downloadLocker.Lock(fileID, "")
 	reader, err := binding.Telegram.Download(ctx, fileID)
 	if err != nil {
+		releaseFileLock()
 		release()
 		return nil, err
 	}
-	return &releaseReadCloser{ReadCloser: reader, release: release}, nil
+	return &releaseReadCloser{ReadCloser: reader, release: func() {
+		releaseFileLock()
+		release()
+	}}, nil
 }
 
 func (s *ObjectStore) acquire(ctx context.Context, sem chan struct{}) func() {
