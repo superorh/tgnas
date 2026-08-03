@@ -35,6 +35,7 @@ type UploadedFile struct {
 type Client interface {
 	Upload(ctx context.Context, request UploadRequest) (UploadedFile, error)
 	Download(ctx context.Context, fileID string) (io.ReadCloser, error)
+	DeleteMessage(ctx context.Context, chatID string, messageID int64) error
 }
 
 type RequestError struct {

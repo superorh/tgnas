@@ -443,6 +443,98 @@ func TestStoreDeleteObjectMissingKeyReturnsNil(t *testing.T) {
 	}
 }
 
+// TestStoreDeleteObjectDeletesTelegramMessage guards against a real
+// production incident: DeleteObject only ever removed tgnas' own metadata
+// row - it never called Telegram's deleteMessage, so every uploaded message
+// was permanent regardless of any S3-level delete/copy/move. This made the
+// whole "move deletions to a drafts channel" scheme pointless for its
+// actual goal (keep the source channel's real message count matching what
+// tgnas thinks exists): confirmed live, a file moved to drafts via
+// --backup-dir ended up in *both* channels, not just drafts.
+func TestStoreDeleteObjectDeletesTelegramMessage(t *testing.T) {
+	ctx := context.Background()
+	objectStore, fake := newReadyTestObjectStore(t, map[string]string{"photos": "-100"})
+	if _, err := objectStore.PutObject(ctx, PutObjectInput{Bucket: "photos", Key: "hello.txt", Size: 5, Body: strings.NewReader("hello")}); err != nil {
+		t.Fatalf("PutObject returned error: %v", err)
+	}
+	if len(fake.Uploads) != 1 {
+		t.Fatalf("uploads = %+v, want 1", fake.Uploads)
+	}
+	wantMessageID := int64(len(fake.Uploads))
+
+	if err := objectStore.DeleteObject(ctx, "photos", "hello.txt"); err != nil {
+		t.Fatalf("DeleteObject returned error: %v", err)
+	}
+
+	if len(fake.DeletedMessageIDs) != 1 || fake.DeletedMessageIDs[0] != wantMessageID {
+		t.Fatalf("deleted message ids = %+v, want [%d]", fake.DeletedMessageIDs, wantMessageID)
+	}
+	if _, _, err := objectStore.GetObject(ctx, GetObjectInput{Bucket: "photos", Key: "hello.txt"}); err != ErrNoSuchKey {
+		t.Fatalf("GetObject after delete err = %v, want ErrNoSuchKey", err)
+	}
+}
+
+func TestStoreDeleteObjectTreatsAlreadyGoneMessageAsSuccess(t *testing.T) {
+	ctx := context.Background()
+	objectStore, fake := newReadyTestObjectStore(t, map[string]string{"photos": "-100"})
+	if _, err := objectStore.PutObject(ctx, PutObjectInput{Bucket: "photos", Key: "hello.txt", Size: 5, Body: strings.NewReader("hello")}); err != nil {
+		t.Fatalf("PutObject returned error: %v", err)
+	}
+	fake.DeleteMessageFunc = func(ctx context.Context, chatID string, messageID int64) error {
+		return errors.New("Bad Request: message to delete not found")
+	}
+
+	if err := objectStore.DeleteObject(ctx, "photos", "hello.txt"); err != nil {
+		t.Fatalf("DeleteObject returned error: %v, want nil (already-gone message treated as success)", err)
+	}
+	if _, _, err := objectStore.GetObject(ctx, GetObjectInput{Bucket: "photos", Key: "hello.txt"}); err != ErrNoSuchKey {
+		t.Fatalf("GetObject after delete err = %v, want ErrNoSuchKey", err)
+	}
+}
+
+// TestStoreDeleteObjectTreatsTooOldToDeleteAsSuccessButOrphansMessage guards
+// against a real production incident: Telegram's Bot API refuses to delete
+// channel messages older than ~48h, even with can_delete_messages granted
+// and saved as an admin right - a hard platform limit, not a fixable
+// permission issue. Without tolerating this, --backup-dir sync fails
+// outright on every deletion of a file uploaded more than 2 days earlier,
+// which is the common case.
+func TestStoreDeleteObjectTreatsTooOldToDeleteAsSuccessButOrphansMessage(t *testing.T) {
+	ctx := context.Background()
+	objectStore, fake := newReadyTestObjectStore(t, map[string]string{"photos": "-100"})
+	if _, err := objectStore.PutObject(ctx, PutObjectInput{Bucket: "photos", Key: "hello.txt", Size: 5, Body: strings.NewReader("hello")}); err != nil {
+		t.Fatalf("PutObject returned error: %v", err)
+	}
+	fake.DeleteMessageFunc = func(ctx context.Context, chatID string, messageID int64) error {
+		return errors.New("Bad Request: message can't be deleted")
+	}
+
+	if err := objectStore.DeleteObject(ctx, "photos", "hello.txt"); err != nil {
+		t.Fatalf("DeleteObject returned error: %v, want nil (>48h Bot API limit tolerated, not a failure)", err)
+	}
+	if _, _, err := objectStore.GetObject(ctx, GetObjectInput{Bucket: "photos", Key: "hello.txt"}); err != ErrNoSuchKey {
+		t.Fatalf("GetObject after delete err = %v, want ErrNoSuchKey (metadata removed even though the Telegram message itself is orphaned)", err)
+	}
+}
+
+func TestStoreDeleteObjectFailsAndKeepsMetadataOnRealTelegramError(t *testing.T) {
+	ctx := context.Background()
+	objectStore, fake := newReadyTestObjectStore(t, map[string]string{"photos": "-100"})
+	if _, err := objectStore.PutObject(ctx, PutObjectInput{Bucket: "photos", Key: "hello.txt", Size: 5, Body: strings.NewReader("hello")}); err != nil {
+		t.Fatalf("PutObject returned error: %v", err)
+	}
+	fake.DeleteMessageFunc = func(ctx context.Context, chatID string, messageID int64) error {
+		return errors.New("Bad Request: chat not found")
+	}
+
+	if err := objectStore.DeleteObject(ctx, "photos", "hello.txt"); err == nil {
+		t.Fatal("DeleteObject returned nil error, want error for a real Telegram failure")
+	}
+	if _, _, err := objectStore.GetObject(ctx, GetObjectInput{Bucket: "photos", Key: "hello.txt"}); err != nil {
+		t.Fatalf("GetObject after failed delete err = %v, want object to still be retrievable", err)
+	}
+}
+
 func TestStoreSingleUploadTempFileRemovedAfterMetadataFailure(t *testing.T) {
 	ctx := context.Background()
 	tempRoot := t.TempDir()
