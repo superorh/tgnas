@@ -717,20 +717,23 @@ func (s *ObjectStore) CopyObject(ctx context.Context, input CopyObjectInput) (Co
 		return CopyObjectResult{}, err
 	}
 
-	// A chunk's Telegram file_id is only ever valid for the bot that sent or
-	// received it - it does not carry over to a different bot token. Buckets
-	// that share the same bot (e.g. two logical buckets both using the
-	// default bot) can be "copied" for free by just repointing metadata at
-	// the same chunks. Buckets on different bots (immich-library-drafts
-	// deliberately uses its own TGNAS_BOT_TOKEN_DRAFTS, to spread rate
-	// limits) cannot: a metadata-only copy there produced an object that
-	// LOOKED copied (S3 metadata said so, rclone reported success) but was
-	// never actually retrievable through the destination bucket's bot and
-	// never showed up in its Telegram chat at all - confirmed in production
-	// (no message ever appeared in the drafts channel despite "Moved into
-	// backup dir" in the sync log). In that case a real copy is required:
-	// download via the source bot, re-upload via the destination bot.
-	if sourceBinding.TokenKey == destBinding.TokenKey {
+	// The cheap path only repoints metadata at the same underlying Telegram
+	// chunks - no new message is ever posted anywhere. That's only correct
+	// when the destination is, for Telegram's purposes, the exact same
+	// place: same bot AND same chat. If the chat differs (e.g.
+	// immich-library-drafts, meant to hold a visibly separate, inspectable
+	// copy of anything moved out of immich-library), a real copy is
+	// required even when both buckets happen to share a bot token -
+	// otherwise the "copy" is purely a database fiction: no message ever
+	// appears in the destination chat, confirmed in production (rclone's
+	// sync log reported "Moved into backup dir", yet the drafts channel
+	// stayed empty, because immich-library-drafts's configured bot token
+	// turned out to be identical to the default bucket's - same bot, so the
+	// metadata-only path fired, but a different chat still needed an
+	// actual new message). Different bots need a real copy regardless of
+	// chat, for the original reason: a file_id is only ever valid for the
+	// bot that sent or received it.
+	if sourceBinding.TokenKey == destBinding.TokenKey && sourceBinding.ChatID == destBinding.ChatID {
 		return s.copyObjectMetadataOnly(ctx, input)
 	}
 	return s.copyObjectReupload(ctx, input)

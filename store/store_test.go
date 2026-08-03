@@ -103,18 +103,24 @@ func TestStorePutHeadDeleteAndList(t *testing.T) {
 	}
 }
 
-// TestStoreCopyObjectCopiesMetadataWithoutReuploadingToTelegram guards
-// against a real production incident: CopyObject (used by rclone's
-// --backup-dir, e.g. to move a deleted file's Telegram copy aside before
-// deleting it) was entirely unimplemented - the S3 route fell through to
-// PutObject, which read the request's empty body (a CopyObject request has
-// no body, the source is named via a header) and silently created a
-// 0-byte object, then failed to return the XML body S3 clients require,
-// surfacing as "deserialization failed, received empty response payload"
-// and aborting every sync that needed to move a file to backup-dir. A copy
-// only needs to point new metadata at the same Telegram chunks under the
-// new bucket/key - no re-upload required.
-func TestStoreCopyObjectCopiesMetadataWithoutReuploadingToTelegram(t *testing.T) {
+// TestStoreCopyObjectToDifferentChatReuploadsAndPreservesMetadata guards
+// against two real production incidents layered on top of each other.
+// First: CopyObject (used by rclone's --backup-dir, e.g. to move a deleted
+// file's Telegram copy aside before deleting it) was entirely
+// unimplemented - the S3 route fell through to PutObject, which read the
+// request's empty body (a CopyObject request has no body, the source is
+// named via a header) and silently created a 0-byte object, then failed to
+// return the XML body S3 clients require, surfacing as "deserialization
+// failed, received empty response payload" and aborting every sync that
+// needed to move a file to backup-dir. Second, once CopyObject existed: a
+// metadata-only copy (just repointing at the same chunk, keeping its
+// original message_id) is only valid when the destination is the exact
+// same Telegram chat - immich-library-drafts exists specifically to hold a
+// visibly separate, inspectable copy of anything moved out of
+// immich-library, so a different destination chat_id must always produce
+// a real new message there, even when (as happened in production, by
+// misconfiguration) both buckets share the same bot token.
+func TestStoreCopyObjectToDifferentChatReuploadsAndPreservesMetadata(t *testing.T) {
 	ctx := context.Background()
 	objectStore, fake := newReadyTestObjectStore(t, map[string]string{"immich-library": "-100", "immich-library-drafts": "-200"})
 
@@ -122,8 +128,8 @@ func TestStoreCopyObjectCopiesMetadataWithoutReuploadingToTelegram(t *testing.T)
 	if err != nil {
 		t.Fatalf("PutObject returned error: %v", err)
 	}
-	if len(fake.Uploads) != 1 {
-		t.Fatalf("uploads after PutObject = %d, want 1", len(fake.Uploads))
+	if len(fake.Uploads) != 1 || fake.Uploads[0].ChatID != "-100" {
+		t.Fatalf("uploads after PutObject = %+v, want one upload to chat -100", fake.Uploads)
 	}
 
 	copyResult, err := objectStore.CopyObject(ctx, CopyObjectInput{
@@ -138,8 +144,14 @@ func TestStoreCopyObjectCopiesMetadataWithoutReuploadingToTelegram(t *testing.T)
 	if copyResult.ETag != putResult.ETag {
 		t.Fatalf("copy etag = %q, want %q", copyResult.ETag, putResult.ETag)
 	}
-	if len(fake.Uploads) != 1 {
-		t.Fatalf("uploads after CopyObject = %d, want still 1 (no re-upload)", len(fake.Uploads))
+
+	// A real, second message must have been posted to the drafts chat -
+	// not just a metadata row pointing at the original chat -100 message.
+	if len(fake.Uploads) != 2 {
+		t.Fatalf("uploads after CopyObject = %d, want 2 (a real upload to the drafts chat)", len(fake.Uploads))
+	}
+	if fake.Uploads[1].ChatID != "-200" {
+		t.Fatalf("second upload chat = %q, want -200", fake.Uploads[1].ChatID)
 	}
 
 	head, err := objectStore.HeadObject(ctx, "immich-library-drafts", "photo.jpg")
