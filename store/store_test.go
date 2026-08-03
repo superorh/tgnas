@@ -70,6 +70,107 @@ func TestStoreHeadBucketRejectsDisabledStartupBucket(t *testing.T) {
 	}
 }
 
+// TestStorePutObjectOverwriteDeletesPreviousTelegramMessage guards against a
+// real production incident: PutObject on a key that already held an object
+// only ever replaced tgnas' metadata row - it never deleted the PREVIOUS
+// chunk's Telegram message, silently orphaning it. This was the dominant
+// source of duplicate messages piling up in the storage channel: files
+// repeatedly re-synced (because of a still-unexplained network corruption
+// issue causing checksum mismatches) kept accumulating a new orphaned
+// message on every retry, with no --backup-dir/CopyObject/DeleteObject
+// codepath involved at all - a plain overwrite via rclone copy (or sync)
+// leaks exactly the same way DeleteObject used to before it was fixed.
+func TestStorePutObjectOverwriteDeletesPreviousTelegramMessage(t *testing.T) {
+	ctx := context.Background()
+	objectStore, fake := newReadyTestObjectStore(t, map[string]string{"photos": "-100"})
+
+	first, err := objectStore.PutObject(ctx, PutObjectInput{Bucket: "photos", Key: "hello.txt", ContentType: "text/plain", Size: 5, Body: strings.NewReader("hello")})
+	if err != nil {
+		t.Fatalf("first PutObject returned error: %v", err)
+	}
+	if len(fake.Uploads) != 1 {
+		t.Fatalf("uploads after first PutObject = %d, want 1", len(fake.Uploads))
+	}
+	firstMessageID := int64(len(fake.Uploads))
+
+	second, err := objectStore.PutObject(ctx, PutObjectInput{Bucket: "photos", Key: "hello.txt", ContentType: "text/plain", Size: 7, Body: strings.NewReader("hello2!")})
+	if err != nil {
+		t.Fatalf("second PutObject returned error: %v", err)
+	}
+	if second.ETag == first.ETag {
+		t.Fatalf("second etag = %q, want different from first (%q)", second.ETag, first.ETag)
+	}
+	if len(fake.Uploads) != 2 {
+		t.Fatalf("uploads after second PutObject = %d, want 2", len(fake.Uploads))
+	}
+
+	if len(fake.DeletedMessageIDs) != 1 || fake.DeletedMessageIDs[0] != firstMessageID {
+		t.Fatalf("deleted message ids = %+v, want [%d] (the overwritten first upload)", fake.DeletedMessageIDs, firstMessageID)
+	}
+
+	reader, _, err := objectStore.GetObject(ctx, GetObjectInput{Bucket: "photos", Key: "hello.txt"})
+	if err != nil {
+		t.Fatalf("GetObject returned error: %v", err)
+	}
+	defer reader.Close()
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll returned error: %v", err)
+	}
+	if string(data) != "hello2!" {
+		t.Fatalf("content = %q, want %q", string(data), "hello2!")
+	}
+}
+
+// TestStorePutObjectFirstUploadDoesNotAttemptCleanup guards a simple edge
+// case: a brand-new key (nothing to replace) must not try to delete
+// anything.
+func TestStorePutObjectFirstUploadDoesNotAttemptCleanup(t *testing.T) {
+	ctx := context.Background()
+	objectStore, fake := newReadyTestObjectStore(t, map[string]string{"photos": "-100"})
+
+	if _, err := objectStore.PutObject(ctx, PutObjectInput{Bucket: "photos", Key: "new.txt", ContentType: "text/plain", Size: 5, Body: strings.NewReader("hello")}); err != nil {
+		t.Fatalf("PutObject returned error: %v", err)
+	}
+	if len(fake.DeletedMessageIDs) != 0 {
+		t.Fatalf("deleted message ids = %+v, want none", fake.DeletedMessageIDs)
+	}
+}
+
+// TestStorePutObjectOverwriteToleratesDeleteFailureWithoutFailingUpload
+// guards against a subtle regression: since the new content is already
+// safely stored by the time the old message's cleanup runs, a Telegram
+// failure deleting the OLD message must never fail the PutObject call
+// itself - only DeleteObject's own explicit-delete contract is that strict.
+func TestStorePutObjectOverwriteToleratesDeleteFailureWithoutFailingUpload(t *testing.T) {
+	ctx := context.Background()
+	objectStore, fake := newReadyTestObjectStore(t, map[string]string{"photos": "-100"})
+
+	if _, err := objectStore.PutObject(ctx, PutObjectInput{Bucket: "photos", Key: "hello.txt", ContentType: "text/plain", Size: 5, Body: strings.NewReader("hello")}); err != nil {
+		t.Fatalf("first PutObject returned error: %v", err)
+	}
+	fake.DeleteMessageFunc = func(ctx context.Context, chatID string, messageID int64) error {
+		return errors.New("Bad Request: chat not found")
+	}
+
+	if _, err := objectStore.PutObject(ctx, PutObjectInput{Bucket: "photos", Key: "hello.txt", ContentType: "text/plain", Size: 7, Body: strings.NewReader("hello2!")}); err != nil {
+		t.Fatalf("second PutObject returned error: %v, want nil even though cleanup of the old message failed", err)
+	}
+
+	reader, _, err := objectStore.GetObject(ctx, GetObjectInput{Bucket: "photos", Key: "hello.txt"})
+	if err != nil {
+		t.Fatalf("GetObject returned error: %v", err)
+	}
+	defer reader.Close()
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll returned error: %v", err)
+	}
+	if string(data) != "hello2!" {
+		t.Fatalf("content = %q, want %q", string(data), "hello2!")
+	}
+}
+
 func TestStorePutHeadDeleteAndList(t *testing.T) {
 	ctx := context.Background()
 	objectStore, fake := newReadyTestObjectStore(t, map[string]string{"photos": "-100"})

@@ -240,6 +240,14 @@ func (s *ObjectStore) PutObject(ctx context.Context, input PutObjectInput) (PutO
 	releaseLock := s.locker.Lock(input.Bucket, input.Key)
 	defer releaseLock()
 
+	// Capture the chunks of whatever object this upload is about to
+	// replace, if any, so their Telegram messages can be cleaned up once
+	// the new content is safely stored. See cleanupReplacedChunks.
+	var previousChunks []metadata.Chunk
+	if _, existing, err := s.meta.GetObject(ctx, input.Bucket, input.Key); err == nil {
+		previousChunks = existing
+	}
+
 	strategy, err := s.resolver.Resolve(path.Base(input.Key), input.ContentType, input.Size)
 	if err != nil {
 		return PutObjectResult{}, err
@@ -255,17 +263,23 @@ func (s *ObjectStore) PutObject(ctx context.Context, input PutObjectInput) (PutO
 	}
 	s.logger.Printf("debug event=put_object_decision bucket=%q key=%q size=%d telegram_type=%q strategy=%q chunked=%t chunk_size=%d chunk_count=%d", input.Bucket, input.Key, input.Size, strategy.TelegramType, strategy.UploadStrategy, strategy.Chunked, chunkSize, chunkCount)
 
+	var result PutObjectResult
 	if input.Size == 0 {
-		return s.putEmpty(ctx, input, strategy)
-	}
-	if !strategy.Chunked {
+		result, err = s.putEmpty(ctx, input, strategy)
+	} else if !strategy.Chunked {
 		limit := s.options.Upload.TypeLimits[strategy.TelegramType]
 		if limit > 0 && input.Size > limit {
 			return PutObjectResult{}, ErrEntityTooLarge
 		}
-		return s.putSingle(ctx, input, strategy)
+		result, err = s.putSingle(ctx, input, strategy)
+	} else {
+		result, err = s.putChunked(ctx, input, strategy)
 	}
-	return s.putChunked(ctx, input, strategy)
+	if err != nil {
+		return PutObjectResult{}, err
+	}
+	s.cleanupReplacedChunks(ctx, input.Bucket, input.Key, previousChunks)
+	return result, nil
 }
 
 func (s *ObjectStore) CreateMultipartUpload(ctx context.Context, input CreateMultipartUploadInput) (CreateMultipartUploadResult, error) {
@@ -494,12 +508,18 @@ func (s *ObjectStore) CompleteMultipartUpload(ctx context.Context, input Complet
 	contentType := upload.contentType
 	s.multipartMu.Unlock()
 
+	var previousChunks []metadata.Chunk
+	if _, existing, err := s.meta.GetObject(ctx, input.Bucket, input.Key); err == nil {
+		previousChunks = existing
+	}
+
 	object, chunks, etag := buildMultipartObject(input.Bucket, input.Key, contentType, parts)
 	if err := s.meta.PutObject(ctx, object, chunks); err != nil {
 		s.logMetadataPutObject(input.Bucket, input.Key, len(chunks), etag, err)
 		return CompleteMultipartUploadResult{}, err
 	}
 	s.logMetadataPutObject(input.Bucket, input.Key, len(chunks), etag, nil)
+	s.cleanupReplacedChunks(ctx, input.Bucket, input.Key, previousChunks)
 
 	s.multipartMu.Lock()
 	delete(s.multipartUploads, input.UploadID)
@@ -960,28 +980,9 @@ func (s *ObjectStore) DeleteObject(ctx context.Context, bucket, key string) erro
 		return err
 	}
 	for _, chunk := range chunks {
-		if err := binding.Telegram.DeleteMessage(ctx, binding.ChatID, chunk.TelegramMessageID); err != nil {
-			if isMessageAlreadyGone(err) {
-				s.logger.Printf("debug event=telegram_delete_message bucket=%q key=%q message_id=%d result=already_gone", bucket, key, chunk.TelegramMessageID)
-				continue
-			}
-			if isMessageTooOldToDelete(err) {
-				// Confirmed empirically: Telegram's Bot API refuses to delete
-				// channel messages older than ~48h, even with the bot granted
-				// can_delete_messages/"Supprimer les messages d'autrui" as an
-				// explicitly saved admin right - a hard platform limit, not a
-				// fixable config/permission issue. Proceeding anyway: the
-				// alternative is --backup-dir sync failing outright on every
-				// deletion older than 48h, forever. The old message is left
-				// orphaned (invisible to tgnas, but still physically present)
-				// in the source bucket's channel.
-				s.logger.Printf("WARNING event=telegram_delete_message bucket=%q key=%q message_id=%d result=orphaned_too_old error=%q", bucket, key, chunk.TelegramMessageID, sanitizeLogError(err))
-				continue
-			}
-			s.logger.Printf("debug event=telegram_delete_message bucket=%q key=%q message_id=%d result=error error=%q", bucket, key, chunk.TelegramMessageID, sanitizeLogError(err))
-			return fmt.Errorf("delete telegram message %d: %w", chunk.TelegramMessageID, err)
+		if err := s.deleteChunkMessage(ctx, binding, bucket, key, chunk); err != nil {
+			return err
 		}
-		s.logger.Printf("debug event=telegram_delete_message bucket=%q key=%q message_id=%d result=success", bucket, key, chunk.TelegramMessageID)
 	}
 	if err := s.meta.DeleteObject(ctx, bucket, key); err != nil {
 		if err == metadata.ErrNotFound {
@@ -990,6 +991,64 @@ func (s *ObjectStore) DeleteObject(ctx context.Context, bucket, key string) erro
 		return err
 	}
 	return nil
+}
+
+// deleteChunkMessage deletes one chunk's Telegram message, tolerating an
+// already-gone message and Telegram's hard ~48h Bot API age limit on
+// deleting channel messages (returns nil in both cases - the caller
+// decides what "tolerated" means for it). Any other error is returned so
+// the caller can propagate or merely log it as appropriate.
+func (s *ObjectStore) deleteChunkMessage(ctx context.Context, binding BucketBinding, bucket, key string, chunk metadata.Chunk) error {
+	err := binding.Telegram.DeleteMessage(ctx, binding.ChatID, chunk.TelegramMessageID)
+	if err == nil {
+		s.logger.Printf("debug event=telegram_delete_message bucket=%q key=%q message_id=%d result=success", bucket, key, chunk.TelegramMessageID)
+		return nil
+	}
+	if isMessageAlreadyGone(err) {
+		s.logger.Printf("debug event=telegram_delete_message bucket=%q key=%q message_id=%d result=already_gone", bucket, key, chunk.TelegramMessageID)
+		return nil
+	}
+	if isMessageTooOldToDelete(err) {
+		// Confirmed empirically: Telegram's Bot API refuses to delete
+		// channel messages older than ~48h, even with the bot granted
+		// can_delete_messages/"Supprimer les messages d'autrui" as an
+		// explicitly saved admin right - a hard platform limit, not a
+		// fixable config/permission issue. Proceeding anyway: the
+		// alternative is --backup-dir sync failing outright on every
+		// deletion older than 48h, forever. The old message is left
+		// orphaned (invisible to tgnas, but still physically present)
+		// in the source bucket's channel.
+		s.logger.Printf("WARNING event=telegram_delete_message bucket=%q key=%q message_id=%d result=orphaned_too_old error=%q", bucket, key, chunk.TelegramMessageID, sanitizeLogError(err))
+		return nil
+	}
+	s.logger.Printf("debug event=telegram_delete_message bucket=%q key=%q message_id=%d result=error error=%q", bucket, key, chunk.TelegramMessageID, sanitizeLogError(err))
+	return fmt.Errorf("delete telegram message %d: %w", chunk.TelegramMessageID, err)
+}
+
+// cleanupReplacedChunks best-effort deletes the Telegram messages of chunks
+// an overwrite just replaced (PutObject/CompleteMultipartUpload on a key
+// that already held an object) - without this, overwriting an existing key
+// silently orphans the old message forever, confirmed in production as the
+// dominant source of duplicate messages piling up in the source channel:
+// files repeatedly re-synced because of the still-unexplained network
+// corruption issue kept accumulating a new orphaned message on every retry,
+// with no --backup-dir/CopyObject/DeleteObject codepath involved at all -
+// a plain overwrite leaks exactly the same way DeleteObject used to. The
+// new content is already safely stored by the time this runs, so any
+// cleanup failure here is only logged, never surfaced as a PutObject error.
+func (s *ObjectStore) cleanupReplacedChunks(ctx context.Context, bucket, key string, previousChunks []metadata.Chunk) {
+	if len(previousChunks) == 0 {
+		return
+	}
+	binding, err := s.bucketBinding(bucket)
+	if err != nil {
+		return
+	}
+	for _, chunk := range previousChunks {
+		if err := s.deleteChunkMessage(ctx, binding, bucket, key, chunk); err != nil {
+			s.logger.Printf("WARNING event=telegram_delete_message_on_overwrite bucket=%q key=%q message_id=%d result=error error=%q", bucket, key, chunk.TelegramMessageID, sanitizeLogError(err))
+		}
+	}
 }
 
 // isMessageAlreadyGone reports whether a Telegram deleteMessage failure means
